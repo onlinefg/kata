@@ -301,6 +301,96 @@ async def handle_captcha(tab, is_renew: bool) -> bool:
             return await solve_altcha_in_modal(tab)
     return True
 
+# ----- 登录页 Cloudflare Turnstile 勾选框点击（坐标点击思路，参考 Zytrano）-----
+async def _turnstile_token_ready(tab) -> bool:
+    """检测 cf-turnstile-response 是否已写入 token（穿透 shadow DOM）"""
+    val = await _js(tab, """
+        (function() {
+            function deepQuery(root, sel) {
+                let el = root.querySelector(sel);
+                if (el) return el;
+                for (const host of root.querySelectorAll('*')) {
+                    if (host.shadowRoot) {
+                        el = deepQuery(host.shadowRoot, sel);
+                        if (el) return el;
+                    }
+                }
+                return null;
+            }
+            const el = deepQuery(document, 'input[name="cf-turnstile-response"]');
+            return el ? (el.value || '').length > 10 : false;
+        })()
+    """)
+    return val is True or str(val).lower() == "true"
+
+async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> bool:
+    """
+    登录表单内嵌的 Cloudflare Turnstile 勾选框（managed 模式，需要点击）。
+    思路同 Zytrano 项目：
+      1. 先静默等待几秒，看 token 是否自动写入（无需点击）
+      2. 用 tab.find_shadow_roots() 穿透 shadow DOM 定位含
+         challenges.cloudflare.com 的 iframe，进入其内部 shadow root
+         拿到真正的 checkbox 元素并 .click()
+      3. 上面失败时，降级为坐标点击：取 iframe 的 bounding box，
+         用 tab.mouse.click(x, y) 在 checkbox 大致位置（左侧 ~25px）点一下
+      4. 点击后再等待 token 写入确认是否成功
+    """
+    print("   >> 检测登录页 Turnstile 勾选框...", flush=True)
+
+    # 阶段1：静默等待，看是否已自动通过
+    for _ in range(6):
+        if await _turnstile_token_ready(tab):
+            print("   >> ✅ Turnstile 已自动通过，无需点击", flush=True)
+            return True
+        await asyncio.sleep(0.5)
+
+    # 阶段2：尝试通过 shadow root 精确定位 checkbox 并点击（pydoll 原生穿透方式）
+    try:
+        shadow_root = await tab._find_cloudflare_shadow_root(timeout=timeout)
+        iframe = await shadow_root.query('iframe[src*="challenges.cloudflare.com"]', timeout=int(timeout))
+        body = await iframe.find(tag_name="body", timeout=int(timeout))
+        inner_shadow = await body.get_shadow_root(timeout=timeout)
+        checkbox = await inner_shadow.query("span.cb-i", timeout=int(timeout))
+        await checkbox.click()
+        print("   >> ✅ Turnstile checkbox 已点击（shadow root 精确定位）", flush=True)
+    except Exception as e:
+        print(f"   >> shadow root 定位失败（{e}），降级为坐标点击...", flush=True)
+        try:
+            iframe_el = None
+            # 在所有 iframe 中找 src 含 challenges.cloudflare.com 的那个
+            candidates = await tab.find(tag_name="iframe", find_all=True, timeout=5, raise_exc=False)
+            if candidates:
+                for el in (candidates if isinstance(candidates, list) else [candidates]):
+                    src = el.get_attribute("src") or ""
+                    if "challenges.cloudflare.com" in src:
+                        iframe_el = el
+                        break
+            if not iframe_el:
+                print("   >> ❌ 未找到 Turnstile iframe，放弃点击", flush=True)
+                await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_iframe_not_found.png"))
+                return False
+
+            bounds = await iframe_el.get_bounds_using_js()
+            x = bounds["x"] + 25
+            y = bounds["y"] + bounds["height"] / 2
+            print(f"   >> 坐标点击 Turnstile checkbox ({x:.0f}, {y:.0f})", flush=True)
+            await tab.mouse.click(x, y, humanize=True)
+        except Exception as e2:
+            print(f"   >> ❌ 坐标点击也失败: {e2}", flush=True)
+            await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_click_failed.png"))
+            return False
+
+    # 阶段3：点击后等待 token 写入确认
+    for i in range(int(timeout * 2)):
+        if await _turnstile_token_ready(tab):
+            print(f"   >> ✅ Turnstile token 就绪（{i * 0.5:.1f}s）", flush=True)
+            return True
+        await asyncio.sleep(0.5)
+
+    print("   >> ❌ Turnstile token 等待超时", flush=True)
+    await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_token_timeout.png"))
+    return False
+
 # ----- 登录 -----
 
 def mask_email(email: str) -> str:
@@ -371,6 +461,17 @@ async def do_login(browser, tab, user: dict) -> bool:
 
         await handle_captcha(tab, is_renew=False)
         await asyncio.sleep(0.3)
+
+        # ★ 登录页 Cloudflare Turnstile 勾选框（"请验证您是真人"）
+        has_turnstile = await _js(tab, "!!document.querySelector('input[name=\"cf-turnstile-response\"]')")
+        if has_turnstile is True or str(has_turnstile).lower() == "true":
+            ok = await click_login_turnstile_checkbox(browser, tab, timeout=20)
+            if not ok:
+                print("   >> Turnstile 未完成，刷新重试...", flush=True)
+                await tab.refresh()
+                await asyncio.sleep(2)
+                continue
+
         await tab.execute_script("""(function() {
             const bar = document.querySelector('[aria-label="Save password?"]');
             if (bar) bar.remove();
