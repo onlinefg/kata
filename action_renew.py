@@ -344,27 +344,40 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
             return True
         await asyncio.sleep(0.5)
 
-    # 阶段2：尝试通过 shadow root 精确定位 checkbox 并点击（pydoll 原生穿透方式）
-    try:
-        shadow_root = await tab._find_cloudflare_shadow_root(timeout=timeout)
-        iframe = await shadow_root.query('iframe[src*="challenges.cloudflare.com"]', timeout=int(timeout))
-        body = await iframe.find(tag_name="body", timeout=int(timeout))
-        inner_shadow = await body.get_shadow_root(timeout=timeout)
-        checkbox = await inner_shadow.query("span.cb-i", timeout=int(timeout))
-        await checkbox.click()
-        print("   >> ✅ Turnstile checkbox 已点击（shadow root 精确定位）", flush=True)
-    except Exception as e:
-        print(f"   >> shadow root 定位失败（{e}），降级为坐标点击...", flush=True)
+    # 阶段2：用 deep=True 穿透跨进程 OOPIF，直接在所有 shadow root（包括
+    # Turnstile iframe 内部、属于独立渲染进程的那一层）里找真正的 checkbox。
+    # 注：pydoll 内置的 _find_cloudflare_shadow_root + iframe.find('body').get_shadow_root()
+    # 只能处理同进程 shadow DOM；Turnstile 的 iframe 大多数情况下是跨域 OOPIF，
+    # 那条路径必然超时（这也是日志里 "Error in cloudflare bypass" 的原因），
+    # 所以这里改用 deep 穿透直接拿 checkbox，不再手动下钻 iframe -> body -> shadow。
+    checkbox_clicked = False
+    deadline = asyncio.get_event_loop().time() + timeout
+    last_err = None
+    while asyncio.get_event_loop().time() < deadline:
         try:
-            iframe_el = None
-            # 在所有 iframe 中找 src 含 challenges.cloudflare.com 的那个
-            candidates = await tab.find(tag_name="iframe", find_all=True, timeout=5, raise_exc=False)
-            if candidates:
-                for el in (candidates if isinstance(candidates, list) else [candidates]):
-                    src = el.get_attribute("src") or ""
-                    if "challenges.cloudflare.com" in src:
-                        iframe_el = el
-                        break
+            shadow_roots = await tab.find_shadow_roots(deep=True)
+            for sr in shadow_roots:
+                checkbox = await sr.query("span.cb-i", raise_exc=False)
+                if checkbox:
+                    await checkbox.click()
+                    checkbox_clicked = True
+                    print("   >> ✅ Turnstile checkbox 已点击（deep shadow root 定位，含 OOPIF）", flush=True)
+                    break
+        except Exception as e:
+            last_err = e
+        if checkbox_clicked:
+            break
+        await asyncio.sleep(0.5)
+
+    if not checkbox_clicked:
+        print(f"   >> deep shadow root 未找到 checkbox（{last_err}），降级为坐标点击...", flush=True)
+        try:
+            # 坐标点击兜底：iframe 本身在（非跨进程那层）shadow DOM 里，
+            # 亮 DOM 的 tab.find() 看不到它，必须先拿到外层 shadow root 再 query。
+            shadow_root = await tab._find_cloudflare_shadow_root(timeout=5)
+            iframe_el = await shadow_root.query(
+                'iframe[src*="challenges.cloudflare.com"]', timeout=5, raise_exc=False
+            )
             if not iframe_el:
                 print("   >> ❌ 未找到 Turnstile iframe，放弃点击", flush=True)
                 await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_iframe_not_found.png"))
