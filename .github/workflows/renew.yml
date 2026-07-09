@@ -26,7 +26,9 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq chromium-browser xvfb curl ffmpeg
+          curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb
+          sudo apt-get install -y -qq /tmp/chrome.deb
+          sudo apt-get install -y -qq xvfb curl ffmpeg
 
       - name: 安装 Python
         uses: actions/setup-python@v5
