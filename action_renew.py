@@ -308,77 +308,112 @@ async def _turnstile_token_ready(tab) -> bool:
     """)
     return val is True or str(val).lower() == "true"
 
+async def _dump_frames(tab, label: str):
+    """打印当前所有 frame URL，用于诊断 Turnstile 找不到的情况"""
+    try:
+        frames = await tab.get_frames()
+        print(f"   [诊断/{label}] 共 {len(frames)} 个 frame：", flush=True)
+        for i, f in enumerate(frames):
+            url = (getattr(f, 'url', '') or 'about:blank')[:120]
+            print(f"     [{i}] {url}", flush=True)
+    except Exception as e:
+        print(f"   [诊断/{label}] dump_frames 失败: {e}", flush=True)
+
+
 async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> bool:
     """
-    登录表单内嵌的 Cloudflare Turnstile 勾选框（managed 模式，需要点击）。
-    思路同 Zytrano 项目：
-      1. 先静默等待几秒，看 token 是否自动写入（无需点击）
-      2. 用 tab.find_shadow_roots() 穿透 shadow DOM 定位含
-         challenges.cloudflare.com 的 iframe，进入其内部 shadow root
-         拿到真正的 checkbox 元素并 .click()
-      3. 上面失败时，降级为坐标点击：取 iframe 的 bounding box，
-         用 tab.mouse.click(x, y) 在 checkbox 大致位置（左侧 ~25px）点一下
-      4. 点击后再等待 token 写入确认是否成功
+    登录页 Cloudflare Turnstile 勾选框点击。
+    策略：
+      1. 先静默等待 3s，看 token 是否自动写入（invisible 模式无需点击）
+      2. 枚举 tab.get_frames()，找 challenges.cloudflare.com frame（最可靠）
+         → frame_element().get_bounds_using_js() 取坐标 → 坐标合理性校验 → 点击
+      3. 找不到 frame 时，降级为直接 JS querySelector iframe 取坐标
+      4. 点击后等待 token 写入
     """
     print("   >> 检测登录页 Turnstile 勾选框...", flush=True)
 
-    # 阶段1：静默等待，看是否已自动通过
+    # 阶段1：静默等待，看是否已自动通过（invisible 模式）
     for _ in range(6):
         if await _turnstile_token_ready(tab):
             print("   >> ✅ Turnstile 已自动通过，无需点击", flush=True)
             return True
         await asyncio.sleep(0.5)
 
-    # 阶段2：用 deep=True 穿透跨进程 OOPIF，直接在所有 shadow root（包括
-    # Turnstile iframe 内部、属于独立渲染进程的那一层）里找真正的 checkbox。
-    # 注：pydoll 内置的 _find_cloudflare_shadow_root + iframe.find('body').get_shadow_root()
-    # 只能处理同进程 shadow DOM；Turnstile 的 iframe 大多数情况下是跨域 OOPIF，
-    # 那条路径必然超时（这也是日志里 "Error in cloudflare bypass" 的原因），
-    # 所以这里改用 deep 穿透直接拿 checkbox，不再手动下钻 iframe -> body -> shadow。
-    checkbox_clicked = False
+    # 阶段2：枚举 frames 找 challenges.cloudflare.com（参考 zmp 项目的可靠方案）
+    cf_frame = None
     deadline = asyncio.get_event_loop().time() + timeout
-    last_err = None
     while asyncio.get_event_loop().time() < deadline:
         try:
-            shadow_roots = await tab.find_shadow_roots(deep=True)
-            for sr in shadow_roots:
-                checkbox = await sr.query("span.cb-i", raise_exc=False)
-                if checkbox:
-                    await checkbox.click()
-                    checkbox_clicked = True
-                    print("   >> ✅ Turnstile checkbox 已点击（deep shadow root 定位，含 OOPIF）", flush=True)
+            frames = await tab.get_frames()
+            for f in frames:
+                url = getattr(f, 'url', '') or ''
+                if "challenges.cloudflare.com" in url:
+                    cf_frame = f
                     break
         except Exception as e:
-            last_err = e
-        if checkbox_clicked:
+            print(f"   >> get_frames 失败: {e}", flush=True)
+        if cf_frame:
             break
         await asyncio.sleep(0.5)
 
-    if not checkbox_clicked:
-        print(f"   >> deep shadow root 未找到 checkbox（{last_err}），降级为坐标点击...", flush=True)
+    box = None
+    if cf_frame:
+        print(f"   >> 找到 Turnstile frame: {getattr(cf_frame, 'url', '')[:100]}", flush=True)
+        await asyncio.sleep(1)  # 等 iframe 内容渲染完毕
         try:
-            # 坐标点击兜底：iframe 本身在（非跨进程那层）shadow DOM 里，
-            # 亮 DOM 的 tab.find() 看不到它，必须先拿到外层 shadow root 再 query。
-            shadow_root = await tab._find_cloudflare_shadow_root(timeout=5)
-            iframe_el = await shadow_root.query(
-                'iframe[src*="challenges.cloudflare.com"]', timeout=5, raise_exc=False
-            )
-            if not iframe_el:
-                print("   >> ❌ 未找到 Turnstile iframe，放弃点击", flush=True)
-                await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_iframe_not_found.png"))
-                return False
+            frame_el = await cf_frame.frame_element()
+            box = await frame_el.get_bounds_using_js()
+            print(f"   >> frame bounding_box = {box}", flush=True)
+        except Exception as e:
+            print(f"   >> 获取 frame bounds 失败: {e}", flush=True)
+    else:
+        print("   >> 枚举 frames 未找到 Turnstile frame，尝试 JS 降级...", flush=True)
+        await _dump_frames(tab, "frame未找到")
 
-            bounds = await iframe_el.get_bounds_using_js()
-            x = bounds["x"] + 25
-            y = bounds["y"] + bounds["height"] / 2
-            print(f"   >> 坐标点击 Turnstile checkbox ({x:.0f}, {y:.0f})", flush=True)
-            await tab.mouse.click(x, y, humanize=True)
-        except Exception as e2:
-            print(f"   >> ❌ 坐标点击也失败: {e2}", flush=True)
-            await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_click_failed.png"))
-            return False
+    # 阶段3：frame 枚举失败时降级为 JS querySelector
+    if not box:
+        try:
+            box = await _js(tab, """
+                (function() {
+                    var el = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                    if (!el) return null;
+                    var r = el.getBoundingClientRect();
+                    return {x: r.left, y: r.top, width: r.width, height: r.height};
+                })()
+            """)
+            if box and isinstance(box, dict):
+                print(f"   >> JS 降级 bounding_box = {box}", flush=True)
+            else:
+                box = None
+        except Exception as e:
+            print(f"   >> JS 降级取 bounds 失败: {e}", flush=True)
 
-    # 阶段3：点击后等待 token 写入确认
+    if not box:
+        print("   >> ❌ 未能定位 Turnstile iframe，放弃点击", flush=True)
+        await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_iframe_not_found.png"))
+        await _dump_frames(tab, "定位失败")
+        return False
+
+    # 坐标合理性校验：x/y 必须在视口范围内
+    bx = box.get("x", -1) if isinstance(box, dict) else -1
+    by = box.get("y", -1) if isinstance(box, dict) else -1
+    bh = box.get("height", 0) if isinstance(box, dict) else 0
+    if not (0 < bx < 1200 and 0 < by < 800):
+        print(f"   >> ❌ bounding_box 坐标异常 ({bx:.0f}, {by:.0f})，跳过点击", flush=True)
+        await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_bad_coords.png"))
+        return False
+
+    x = bx + 25
+    y = by + bh / 2
+    print(f"   >> 坐标点击 Turnstile checkbox ({x:.0f}, {y:.0f})", flush=True)
+    try:
+        await tab.mouse.click(x, y, humanize=True)
+    except Exception as e:
+        print(f"   >> ❌ 坐标点击失败: {e}", flush=True)
+        await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_click_failed.png"))
+        return False
+
+    # 阶段4：点击后等待 token 写入
     for i in range(int(timeout * 2)):
         if await _turnstile_token_ready(tab):
             print(f"   >> ✅ Turnstile token 就绪（{i * 0.5:.1f}s）", flush=True)
