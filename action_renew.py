@@ -97,6 +97,8 @@ def build_options():
         print("⚠️ 未找到 Chromium，使用 pydoll 默认路径", flush=True)
 
     opts.add_argument("--window-size=1280,720")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-setuid-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--disable-gpu")
