@@ -158,33 +158,16 @@ async def page_has_text(tab, text: str) -> bool:
         return False
 
 async def take_screenshot(browser, tab, path: str):
+    """pydoll 2.23 的正确方法名是 take_screenshot（不是 screenshot），
+    且没有 tab._connection / tab.connection 这种属性（实际是
+    tab._connection_handler），所以旧版本两条分支永远静默失败，
+    从未真正写出过文件。这里直接调用官方 API，并把异常打印出来，
+    避免以后再次"静默无截图"。"""
     try:
-        if hasattr(tab, 'screenshot'):
-            await tab.screenshot(path)
-            return
-    except Exception:
-        pass
-    try:
-        conn = getattr(browser, '_connection', None) or getattr(browser, 'connection', None)
-        if conn:
-            result = await conn.execute("Page.captureScreenshot", {"format": "png"})
-            data = result.get("data", "")
-            if data:
-                import base64
-                Path(path).write_bytes(base64.b64decode(data))
-                return
-    except Exception:
-        pass
-    try:
-        conn = getattr(tab, '_connection', None) or getattr(tab, 'connection', None)
-        if conn:
-            result = await conn.execute("Page.captureScreenshot", {"format": "png"})
-            data = result.get("data", "")
-            if data:
-                import base64
-                Path(path).write_bytes(base64.b64decode(data))
-    except Exception:
-        pass
+        await tab.take_screenshot(path)
+        print(f"   >> 📸 截图已保存: {path}", flush=True)
+    except Exception as e:
+        print(f"   >> ⚠️ 截图失败 path={path}: {e!r}", flush=True)
 
 # ----- 获取下次续期时间（从页面抓取 Expiry）-----
 async def _get_next_renew_time(tab) -> str:
