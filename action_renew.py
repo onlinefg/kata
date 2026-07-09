@@ -62,10 +62,10 @@ def load_users():
 # ----- Chromium 路径探测 -----
 def _find_chromium() -> str | None:
     candidates = [
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-        "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
         "/snap/bin/chromium",
     ]
     for p in candidates:
