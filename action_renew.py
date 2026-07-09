@@ -436,12 +436,8 @@ async def do_login(browser, tab, user: dict) -> bool:
 
     for attempt in range(1, 4):
         print(f"\n  🔑 登录 {attempt}/3: {mask_email(u)}", flush=True)
-        try:
-            async with tab.expect_and_bypass_cloudflare_captcha():
-                await tab.go_to("https://dashboard.katabump.com/auth/login")
-        except Exception:
-            await tab.go_to("https://dashboard.katabump.com/auth/login")
-        await asyncio.sleep(1.5)
+        await tab.go_to("https://dashboard.katabump.com/auth/login")
+        await asyncio.sleep(3)  # 给页面充分加载时间
 
         if "dashboard" in await get_url(tab) and "login" not in await get_url(tab):
             print("   >> ✅ Session 仍有效", flush=True)
@@ -477,10 +473,10 @@ async def do_login(browser, tab, user: dict) -> bool:
             continue
 
         await handle_captcha(tab, is_renew=False)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(2)  # 等 Turnstile 渲染完成
 
         # ★ 登录页 Cloudflare Turnstile 勾选框（"请验证您是真人"）
-        has_turnstile = await _js(tab, "!!document.querySelector('input[name=\"cf-turnstile-response\"]')")
+        has_turnstile = await _js(tab, "!!document.querySelector('input[name=\"cf-turnstile-response\"]') || !!document.querySelector('div.cf-turnstile')")
         if has_turnstile is True or str(has_turnstile).lower() == "true":
             ok = await click_login_turnstile_checkbox(browser, tab, timeout=20)
             if not ok:
