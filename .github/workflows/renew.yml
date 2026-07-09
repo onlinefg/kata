@@ -17,7 +17,7 @@ on:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: 检出代码
@@ -54,15 +54,24 @@ jobs:
           sleep 1
           if [ "$ENABLE_RECORDING" = "true" ]; then
             ffmpeg -f x11grab -video_size 1280x720 -i :99 \
-              -codec:v libx264 -preset ultrafast -crf 30 -t 300 \
-              -movflags +faststart /tmp/recording.mp4 &
+              -codec:v libx264 -preset ultrafast -crf 30 -t 180 \
+              -movflags +faststart -y /tmp/recording.mp4 &
             RECORD_PID=$!
             sleep 1
           fi
-          timeout 280 python action_renew.py || echo "[EXIT] $?"
+          timeout 150 python action_renew.py || echo "[EXIT] $?"
           if [ "$ENABLE_RECORDING" = "true" ]; then
-            kill $RECORD_PID 2>/dev/null || true
+            # 用 SIGINT（等价于按 q），ffmpeg 会正常收尾写 moov atom，
+            # 而不是被 job 整体超时时 GitHub 直接 SIGKILL 导致文件损坏
+            kill -INT $RECORD_PID 2>/dev/null || true
+            # 给 ffmpeg 最多 10 秒把 moov atom flush 完
+            for i in $(seq 1 10); do
+              kill -0 $RECORD_PID 2>/dev/null || break
+              sleep 1
+            done
+            kill -9 $RECORD_PID 2>/dev/null || true
             wait $RECORD_PID 2>/dev/null || true
+            ls -la /tmp/recording.mp4 || true
           fi
           pkill Xvfb 2>/dev/null || true
 
