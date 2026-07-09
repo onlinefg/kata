@@ -320,15 +320,38 @@ async def _dump_frames(tab, label: str):
         print(f"   [诊断/{label}] dump_frames 失败: {e}", flush=True)
 
 
+async def _find_turnstile_box_js(tab) -> dict | None:
+    """
+    Turnstile iframe 藏在 closed shadow-root 里，JS 无法直接访问 iframe。
+    改为查 div.cf-turnstile 容器本身的坐标——点容器左侧即可触发 checkbox。
+    """
+    js = """
+    (function() {
+        var el = document.querySelector('div.cf-turnstile')
+               || document.querySelector('[data-sitekey]');
+        if (!el) return null;
+        var r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return null;
+        return {x: r.left, y: r.top, width: r.width, height: r.height};
+    })()
+    """
+    try:
+        box = await _js(tab, js)
+        if box and isinstance(box, dict) and box.get("width", 0) > 0:
+            return box
+    except Exception as e:
+        print(f"   >> JS 查找 div.cf-turnstile 失败: {e}", flush=True)
+    return None
+
+
 async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> bool:
     """
     登录页 Cloudflare Turnstile 勾选框点击。
     策略：
       1. 先静默等待 3s，看 token 是否自动写入（invisible 模式无需点击）
-      2. 枚举 tab.get_frames()，找 challenges.cloudflare.com frame（最可靠）
-         → frame_element().get_bounds_using_js() 取坐标 → 坐标合理性校验 → 点击
-      3. 找不到 frame 时，降级为直接 JS querySelector iframe 取坐标
-      4. 点击后等待 token 写入
+      2. JS 递归遍历所有 iframe，找 challenges.cloudflare.com 坐标（可穿透嵌套层）
+      3. 坐标合理性校验 → 点击 checkbox 左侧区域
+      4. 点击后轮询等待 token 写入
     """
     print("   >> 检测登录页 Turnstile 勾选框...", flush=True)
 
@@ -339,70 +362,31 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
             return True
         await asyncio.sleep(0.5)
 
-    # 阶段2：枚举 frames 找 challenges.cloudflare.com（参考 zmp 项目的可靠方案）
-    cf_frame = None
+    # 阶段2：JS 递归遍历所有 iframe 找 Turnstile（含嵌套 wrapper）
+    box = None
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
-        try:
-            frames = await tab.get_frames()
-            for f in frames:
-                url = getattr(f, 'url', '') or ''
-                if "challenges.cloudflare.com" in url:
-                    cf_frame = f
-                    break
-        except Exception as e:
-            print(f"   >> get_frames 失败: {e}", flush=True)
-        if cf_frame:
+        box = await _find_turnstile_box_js(tab)
+        if box:
+            print(f"   >> 找到 Turnstile iframe: {box}", flush=True)
             break
         await asyncio.sleep(0.5)
-
-    box = None
-    if cf_frame:
-        print(f"   >> 找到 Turnstile frame: {getattr(cf_frame, 'url', '')[:100]}", flush=True)
-        await asyncio.sleep(1)  # 等 iframe 内容渲染完毕
-        try:
-            frame_el = await cf_frame.frame_element()
-            box = await frame_el.get_bounds_using_js()
-            print(f"   >> frame bounding_box = {box}", flush=True)
-        except Exception as e:
-            print(f"   >> 获取 frame bounds 失败: {e}", flush=True)
-    else:
-        print("   >> 枚举 frames 未找到 Turnstile frame，尝试 JS 降级...", flush=True)
-        await _dump_frames(tab, "frame未找到")
-
-    # 阶段3：frame 枚举失败时降级为 JS querySelector
-    if not box:
-        try:
-            box = await _js(tab, """
-                (function() {
-                    var el = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                    if (!el) return null;
-                    var r = el.getBoundingClientRect();
-                    return {x: r.left, y: r.top, width: r.width, height: r.height};
-                })()
-            """)
-            if box and isinstance(box, dict):
-                print(f"   >> JS 降级 bounding_box = {box}", flush=True)
-            else:
-                box = None
-        except Exception as e:
-            print(f"   >> JS 降级取 bounds 失败: {e}", flush=True)
 
     if not box:
         print("   >> ❌ 未能定位 Turnstile iframe，放弃点击", flush=True)
         await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_iframe_not_found.png"))
-        await _dump_frames(tab, "定位失败")
         return False
 
     # 坐标合理性校验：x/y 必须在视口范围内
-    bx = box.get("x", -1) if isinstance(box, dict) else -1
-    by = box.get("y", -1) if isinstance(box, dict) else -1
-    bh = box.get("height", 0) if isinstance(box, dict) else 0
-    if not (0 < bx < 1200 and 0 < by < 800):
+    bx = box.get("x", -1)
+    by = box.get("y", -1)
+    bh = box.get("height", 0)
+    if not (0 <= bx < 1200 and 0 <= by < 800):
         print(f"   >> ❌ bounding_box 坐标异常 ({bx:.0f}, {by:.0f})，跳过点击", flush=True)
         await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_bad_coords.png"))
         return False
 
+    # 点击 checkbox（iframe 左侧 25px 水平居中）
     x = bx + 25
     y = by + bh / 2
     print(f"   >> 坐标点击 Turnstile checkbox ({x:.0f}, {y:.0f})", flush=True)
@@ -413,7 +397,7 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
         await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_click_failed.png"))
         return False
 
-    # 阶段4：点击后等待 token 写入
+    # 阶段3：点击后等待 token 写入
     for i in range(int(timeout * 2)):
         if await _turnstile_token_ready(tab):
             print(f"   >> ✅ Turnstile token 就绪（{i * 0.5:.1f}s）", flush=True)
