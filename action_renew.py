@@ -322,25 +322,77 @@ async def _dump_frames(tab, label: str):
 
 async def _find_turnstile_box_js(tab) -> dict | None:
     """
-    Turnstile iframe 藏在 closed shadow-root 里，JS 无法直接访问 iframe。
-    改为查 div.cf-turnstile 容器本身的坐标——点容器左侧即可触发 checkbox。
+    三层 fallback 定位 Turnstile checkbox 坐标：
+    1. div.cf-turnstile 容器（外层，有时 width=0 因内容在 shadow DOM）
+    2. iframe[src*="challenges.cloudflare.com"]（iframe 本身有真实尺寸）
+    3. 任何 width>=200 的 CF iframe（最宽松匹配）
     """
     js = """
     (function() {
+        // Layer 1: div.cf-turnstile 容器
         var el = document.querySelector('div.cf-turnstile')
                || document.querySelector('[data-sitekey]');
-        if (!el) return null;
-        var r = el.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) return null;
-        return {x: r.left, y: r.top, width: r.width, height: r.height};
+        if (el) {
+            var r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0)
+                return {x: r.left, y: r.top, width: r.width, height: r.height, src: 'cf-turnstile-div'};
+        }
+
+        // Layer 2: 直接找 challenges.cloudflare.com iframe
+        var iframes = document.querySelectorAll('iframe');
+        for (var i = 0; i < iframes.length; i++) {
+            var src = iframes[i].src || '';
+            if (src.indexOf('challenges.cloudflare.com') !== -1 ||
+                src.indexOf('turnstile') !== -1) {
+                var r2 = iframes[i].getBoundingClientRect();
+                if (r2.width > 0 && r2.height > 0)
+                    return {x: r2.left, y: r2.top, width: r2.width, height: r2.height, src: 'cf-iframe-direct'};
+            }
+        }
+
+        // Layer 3: 任何宽度在 200-400px 的 iframe（CF Turnstile 标准尺寸）
+        for (var j = 0; j < iframes.length; j++) {
+            var r3 = iframes[j].getBoundingClientRect();
+            if (r3.width >= 200 && r3.width <= 450 && r3.height > 0) {
+                return {x: r3.left, y: r3.top, width: r3.width, height: r3.height, src: 'iframe-size-match'};
+            }
+        }
+
+        // Layer 4: div.cf-turnstile 有 el 但 width=0，返回其 offsetParent 坐标
+        if (el) {
+            var parent = el.closest('div,section,form');
+            if (parent) {
+                var rp = parent.getBoundingClientRect();
+                if (rp.width > 0)
+                    return {x: rp.left, y: rp.top + rp.height * 0.5 - 32,
+                            width: 300, height: 65, src: 'parent-fallback'};
+            }
+        }
+
+        return null;
     })()
     """
     try:
         box = await _js(tab, js)
         if box and isinstance(box, dict) and box.get("width", 0) > 0:
+            print(f"   >> Turnstile 定位成功（{box.get('src','?')}）: {box}", flush=True)
             return box
+        else:
+            # 打印所有 iframe 信息帮助诊断
+            diag = await _js(tab, """
+            (function(){
+                var iframes = document.querySelectorAll('iframe');
+                var info = [];
+                for(var i=0;i<iframes.length;i++){
+                    var r = iframes[i].getBoundingClientRect();
+                    info.push({src: iframes[i].src.substring(0,80), w:r.width, h:r.height, x:r.left, y:r.top});
+                }
+                return JSON.stringify(info);
+            })()
+            """)
+            print(f"   >> 页面 iframe 列表: {diag}", flush=True)
     except Exception as e:
-        print(f"   >> JS 查找 div.cf-turnstile 失败: {e}", flush=True)
+        print(f"   >> JS 查找 Turnstile 失败: {e}", flush=True)
     return None
 
 
@@ -386,8 +438,10 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
         await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_bad_coords.png"))
         return False
 
-    # 点击 checkbox（iframe 左侧 25px 水平居中）
-    x = bx + 25
+    # 点击 checkbox：CF Turnstile checkbox 在容器/iframe 左侧约 28px，垂直居中
+    # src='cf-turnstile-div' 时容器高度一般 65px，checkbox 在 left+28, top+32
+    # src='cf-iframe-*' 时 iframe 就是整个 Turnstile 区域，checkbox 在 left+28, vcenter
+    x = bx + 28
     y = by + bh / 2
     print(f"   >> 坐标点击 Turnstile checkbox ({x:.0f}, {y:.0f})", flush=True)
     try:
