@@ -43,6 +43,7 @@ jobs:
         run: |
           pip install -r requirements.txt
           python -c "from cloakbrowser import ensure_binary; ensure_binary()"
+          python -c "from cloakbrowser.geoip import _ensure_geoip_db; _ensure_geoip_db()"
 
       - name: 下载并启动 Xray 代理
         env:
