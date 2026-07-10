@@ -524,16 +524,7 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
             cx = 152  # checkbox 水平位置固定（登录卡片左侧）
             cy = 390 + addr_bar_h   # 截图内 y=390，加地址栏偏移
             print(f"   >> 自动定位失败，动态坐标兜底 ({cx}, {cy})，窗口={win_w}x{win_h} 地址栏={addr_bar_h}", flush=True)
-            import random as _rand2
-            sx = cx + _rand2.randint(60, 120)
-            sy = cy - _rand2.randint(80, 130)
-            await tab.mouse.move(sx, sy, humanize=True)
-            await asyncio.sleep(_rand2.uniform(0.2, 0.5))
-            await tab.mouse.move(cx, cy, humanize=True)
-            await asyncio.sleep(_rand2.uniform(0.15, 0.35))
-            await tab.mouse.press(cx, cy)
-            await asyncio.sleep(_rand2.uniform(0.08, 0.18))
-            await tab.mouse.release(cx, cy)
+            await tab.mouse.click(cx, cy, humanize=True)
         except Exception as e:
             print(f"   >> 动态坐标点击失败: {e}", flush=True)
             return False
@@ -559,19 +550,8 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
     y = by + bh / 2
     print(f"   >> 坐标点击 Turnstile checkbox ({x:.0f}, {y:.0f})", flush=True)
     try:
-        import random as _rand
-        # 先把鼠标移到密码框附近（自然起点），pydoll humanize=True 走贝塞尔曲线
-        start_x = bx + _rand.randint(60, 120)
-        start_y = by - _rand.randint(80, 130)
-        await tab.mouse.move(start_x, start_y, humanize=True)
-        await asyncio.sleep(_rand.uniform(0.2, 0.5))
-        # 贝塞尔曲线移动到 checkbox
-        await tab.mouse.move(x, y, humanize=True)
-        await asyncio.sleep(_rand.uniform(0.15, 0.35))
-        # press/release 模拟真实点击
-        await tab.mouse.press(x, y)
-        await asyncio.sleep(_rand.uniform(0.08, 0.18))
-        await tab.mouse.release(x, y)
+        # humanize=True 内部：贝塞尔曲线 + Fitts定律 + 生理颤抖 + 超调修正 + 随机按压时长
+        await tab.mouse.click(x, y, humanize=True)
     except Exception as e:
         print(f"   >> ❌ 坐标点击失败: {e}", flush=True)
         await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_click_failed.png"))
