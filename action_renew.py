@@ -241,8 +241,8 @@ def navigate(page, url) -> bool:
     if not is_cf_blocked(page):
         return True
 
-    # 先等自动通过（Managed Challenge 通常 20-35s）
-    if wait_cf_pass(page, timeout=40):
+    # 先等自动通过（最多 10s，过不去就坐标点击）
+    if wait_cf_pass(page, timeout=10):
         return True
 
     # 自动没过，坐标点击
@@ -258,7 +258,7 @@ def navigate(page, url) -> bool:
         pass
     if not is_cf_blocked(page):
         return True
-    if wait_cf_pass(page, timeout=30):
+    if wait_cf_pass(page, timeout=10):
         return True
     return click_cf_checkbox(page, timeout=30)
 
@@ -374,9 +374,9 @@ def do_login(page, user: dict) -> bool:
             log.error("  CF 验证失败，重试")
             continue
 
-        # 检查是否已登录
-        if "login" not in page.url and "dashboard" in page.url:
-            log.info("  ✅ Session 仍有效")
+        # 检查是否已登录（不在 /auth/ 路径下即算有效）
+        if "/auth/" not in page.url:
+            log.info(f"  ✅ Session 仍有效（url={page.url}）")
             return True
 
         try:
@@ -479,11 +479,13 @@ def do_login(page, user: dict) -> bool:
                 if (btn) btn.click();
             }""")
 
-        # 等跳转
+        # 等跳转——katabump 登录成功后离开 /auth/login 即算成功
         for _ in range(12):
             time.sleep(1)
-            if "login" not in page.url and ("dashboard" in page.url or page.url == BASE_URL + "/"):
-                log.info("  ✅ 登录成功")
+            cur = page.url
+            log.info(f"  [等跳转] url={cur}")
+            if "/auth/login" not in cur and "/auth/" not in cur:
+                log.info(f"  ✅ 登录成功（跳转到 {cur}）")
                 take_screenshot(page, "login_success")
                 return True
 
@@ -512,24 +514,42 @@ def do_renew(page, user: dict):
     for attempt in range(1, 4):
         log.info(f"\n🔄 续期 {attempt}/3: {mask_email(u)}")
 
-        # 找 Renew 按钮
-        try:
-            btn = page.locator("button", has_text="Renew").first
-            btn.wait_for(timeout=5000, state="visible")
-        except Exception:
-            log.warning("  找不到 Renew 按钮")
-            return False, "找不到 Renew 按钮"
+        # 先滚到底部确保 Renew 按钮进入视口
+        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(0.5)
 
+        # 找 Renew 按钮（selector 来自 HTML: button[data-bs-target="#renew-modal"]）
+        try:
+            btn = page.locator('button[data-bs-target="#renew-modal"]').first
+            btn.wait_for(timeout=5000, state="visible")
+            log.info("  找到 Renew 按钮（data-bs-target）")
+        except Exception:
+            # 降级：按文字找
+            try:
+                btn = page.locator("button", has_text="Renew").first
+                btn.wait_for(timeout=3000, state="visible")
+                log.info("  找到 Renew 按钮（has_text）")
+            except Exception:
+                log.warning("  找不到 Renew 按钮")
+                take_screenshot(page, f"renew_no_btn_{attempt}")
+                return False, "找不到 Renew 按钮"
+
+        # scroll 到按钮中心再点击，确保 Bootstrap modal 能触发
+        btn.scroll_into_view_if_needed()
+        time.sleep(0.3)
         btn.click()
         log.info("  已点击 Renew，等待 modal...")
 
-        # 等 modal 出现
+        # 等 modal 出现（Bootstrap modal 显示时有 show class 且 display!=none）
         modal_visible = False
         for _ in range(10):
             time.sleep(1)
             visible = page.evaluate("""() => {
                 const m = document.querySelector('#renew-modal');
-                return m && m.getBoundingClientRect().width > 0;
+                if (!m) return false;
+                return m.classList.contains('show') ||
+                       m.getBoundingClientRect().width > 0 ||
+                       getComputedStyle(m).display !== 'none';
             }""")
             if visible:
                 modal_visible = True
