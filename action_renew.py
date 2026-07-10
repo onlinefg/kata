@@ -516,11 +516,14 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
             win = await _js(tab, "({w: window.innerWidth, h: window.innerHeight})")
             win_w = win.get('w', 1280) if isinstance(win, dict) else 1280
             win_h = win.get('h', 720)  if isinstance(win, dict) else 720
-            # 登录卡片宽约420px，居中于窗口；checkbox 在卡片左缘+28px，垂直约78%
-            card_left = (win_w - 420) // 2
-            cx = card_left + 28
-            cy = int(win_h * 0.78)
-            print(f"   >> 自动定位失败，动态坐标兜底 ({cx}, {cy})，窗口={win_w}x{win_h}", flush=True)
+            # 截图分析：
+            # - 截图尺寸 1279x576，窗口 1280x720，差值144px = 浏览器地址栏高度
+            # - checkbox 在截图约 (152, 390)，换算窗口坐标: x=152, y=390+144=534
+            # - 用截图比例动态换算
+            addr_bar_h = win_h - 576  # 地址栏高度（截图高度固定576）
+            cx = 152  # checkbox 水平位置固定（登录卡片左侧）
+            cy = 390 + addr_bar_h   # 截图内 y=390，加地址栏偏移
+            print(f"   >> 自动定位失败，动态坐标兜底 ({cx}, {cy})，窗口={win_w}x{win_h} 地址栏={addr_bar_h}", flush=True)
             await tab.mouse.click(cx, cy, humanize=True)
         except Exception as e:
             print(f"   >> 动态坐标点击失败: {e}", flush=True)
