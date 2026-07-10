@@ -327,8 +327,9 @@ async def _find_turnstile_box_cdp(tab) -> dict | None:
     div.cf-turnstile 容器本身在主文档 DOM 里，offsetTop/Left 是准确的。
     """
     try:
-        box = await _js(tab, """
-        (function() {
+        # 用 JSON.stringify 返回，避免 CDP objectId 问题（pydoll 对象返回值无法直接解析）
+        raw_str = await _js(tab, """
+        JSON.stringify((function() {
             var el = document.querySelector('div.cf-turnstile') || document.querySelector('[data-sitekey]');
             if (!el) return {err: 'no-element', url: window.location.href.substring(0,60)};
             var top = 0, left = 0, cur = el;
@@ -353,8 +354,14 @@ async def _find_turnstile_box_cdp(tab) -> dict | None:
                 winH:   window.innerHeight,
                 src:    'offset-accumulated'
             };
-        })()
+        })())
         """)
+
+        import json as _json
+        try:
+            box = _json.loads(raw_str) if isinstance(raw_str, str) else None
+        except Exception:
+            box = None
 
         if box and isinstance(box, dict):
             if box.get('err'):
@@ -365,13 +372,11 @@ async def _find_turnstile_box_cdp(tab) -> dict | None:
             print(f"   >> offset坐标: x={x:.0f} y={y:.0f} raw=({box.get('rawLeft',0):.0f},{box.get('rawTop',0):.0f}) scroll={box.get('scrollY',0):.0f} 窗口={box.get('winW',0)}x{box.get('winH',0)}", flush=True)
             if x >= 0 and y >= 0:
                 return box
-            # y<0 说明元素在视口上方（页面已滚动），用 rawTop 直接作为绝对坐标
             if box.get('rawTop', 0) > 0:
-                print(f"   >> y<0，用 rawTop={box.get('rawTop',0):.0f} 作绝对坐标", flush=True)
+                print(f"   >> y<0，用 rawTop={box.get('rawTop',0):.0f}", flush=True)
                 return {**box, 'y': box['rawTop'], 'x': box.get('rawLeft', 0)}
-
         else:
-            print(f"   >> JS返回空: box={box}", flush=True)
+            print(f"   >> JS解析失败: raw_str={str(raw_str)[:100]}", flush=True)
 
         return None
     except Exception as e:
@@ -389,7 +394,7 @@ async def _find_turnstile_box_js(tab) -> dict | None:
       3. 递归穿透所有 shadowRoot 找任意 iframe（尺寸匹配）
     """
     js = """
-    (function() {
+    JSON.stringify((function() {
         // 递归穿透 shadow DOM，收集所有元素
         function deepQueryAll(root, sel) {
             var results = [];
@@ -449,10 +454,12 @@ async def _find_turnstile_box_js(tab) -> dict | None:
             info.push({src:(iframes[i].src||'').substring(0,60), w:Math.round(r3.width), h:Math.round(r3.height)});
         }
         return {debug: true, iframes: info, containers: containers.length};
-    })()
+    })())
     """
+    import json as _json2
     try:
-        box = await _js(tab, js)
+        raw_str2 = await _js(tab, js)
+        box = _json2.loads(raw_str2) if isinstance(raw_str2, str) else None
         if box and isinstance(box, dict):
             if box.get("debug"):
                 print(f"   >> Shadow DOM 诊断: iframes={box.get('iframes')}, cf-turnstile容器数={box.get('containers')}", flush=True)
@@ -460,6 +467,8 @@ async def _find_turnstile_box_js(tab) -> dict | None:
             if box.get("width", 0) > 0:
                 print(f"   >> Turnstile 定位成功（{box.get('src','?')}）: x={box.get('x'):.0f} y={box.get('y'):.0f} w={box.get('width'):.0f} h={box.get('height'):.0f}", flush=True)
                 return box
+        else:
+            print(f"   >> JS Shadow DOM raw: {str(raw_str2)[:80]}", flush=True)
     except Exception as e:
         print(f"   >> JS 查找 Turnstile 失败: {e}", flush=True)
     return None
