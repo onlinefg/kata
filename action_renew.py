@@ -322,60 +322,53 @@ async def _dump_frames(tab, label: str):
 
 async def _find_turnstile_box_cdp(tab) -> dict | None:
     """
-    通过 CDP frame tree 确认 Turnstile 存在，再用 JS 累加 offset 定位点击位置。
-    原理：
-    - getBoundingClientRect() 对 closed shadow-root 宿主返回 width=0
-    - offsetTop/offsetLeft 向上累加到根可得到绝对渲染坐标（F12 已验证）
-    - F12 确认 iframe height=65px，offsetWidth=0 时强制用 300x65
+    用 JS 累加 offsetTop/offsetLeft 获取 div.cf-turnstile 的绝对坐标。
+    不依赖 get_frames()（pydoll Tab 不支持），不进入 shadow DOM。
+    div.cf-turnstile 容器本身在主文档 DOM 里，offsetTop/Left 是准确的。
     """
     try:
-        frames = await tab.get_frames()
-        cf_frame = None
-        for f in frames:
-            url = getattr(f, 'url', '') or ''
-            if 'challenges.cloudflare.com' in url or 'turnstile' in url.lower():
-                cf_frame = f
-                print(f"   >> CDP 找到 CF frame: {url[:80]}", flush=True)
-                break
-
-        if cf_frame is None:
-            print(f"   >> CDP frame tree 中共 {len(frames)} 个 frame，无 CF frame", flush=True)
-            for i, f in enumerate(frames[:5]):
-                print(f"     [{i}] {(getattr(f,'url','') or '')[:80]}", flush=True)
-            return None
-
-        # CF frame 存在，用累加 offset 获取真实绝对坐标
         box = await _js(tab, """
         (function() {
             var el = document.querySelector('div.cf-turnstile') || document.querySelector('[data-sitekey]');
             if (!el) return null;
+            // 累加 offsetTop/Left 到根，得到相对于页面顶部的绝对坐标
             var top = 0, left = 0, cur = el;
             while (cur) {
                 top  += cur.offsetTop  || 0;
                 left += cur.offsetLeft || 0;
                 cur   = cur.offsetParent;
             }
+            // 减去滚动量得到视口坐标
+            var viewTop  = top  - window.scrollY;
+            var viewLeft = left - window.scrollX;
+            // 宽高：offsetWidth/Height 可能为 0（closed shadow-root），用已知值兜底
             var w = el.offsetWidth  || 0;
             var h = el.offsetHeight || 0;
             return {
-                x: left,
-                y: top - window.scrollY,
-                width:  w < 10 ? 300 : w,
-                height: h < 10 ? 65  : h,
-                src: 'cdp-offset-accumulated'
+                x:      viewLeft,
+                y:      viewTop,
+                width:  w > 10 ? w : 300,
+                height: h > 10 ? h : 65,
+                winW:   window.innerWidth,
+                winH:   window.innerHeight,
+                src:    'offset-accumulated'
             };
         })()
         """)
 
-        if box and isinstance(box, dict) and box.get('x', -1) >= 0 and box.get('y', -1) >= 0:
-            print(f"   >> offset 坐标: x={box['x']:.0f} y={box['y']:.0f} w={box.get('width',0):.0f} h={box.get('height',0):.0f}", flush=True)
-            return box
+        if box and isinstance(box, dict):
+            x = box.get('x', -1)
+            y = box.get('y', -1)
+            w = box.get('winW', 0)
+            h = box.get('winH', 0)
+            print(f"   >> offset坐标: x={x:.0f} y={y:.0f} w={box.get('width',0):.0f} h={box.get('height',0):.0f} 窗口={w}x{h}", flush=True)
+            if x >= 0 and y >= 0:
+                return box
 
         return None
     except Exception as e:
-        print(f"   >> CDP frame 查找失败: {e}", flush=True)
+        print(f"   >> offset定位失败: {e}", flush=True)
         return None
-
 
 async def _find_turnstile_box_js(tab) -> dict | None:
     """
@@ -498,21 +491,28 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
             break
         await asyncio.sleep(0.5)
 
-    # 阶段2.5：所有方法失败 → 固定坐标兜底（截图确认 checkbox 在约 630,563）
+    # 阶段2.5：所有方法失败 → 动态坐标兜底
+    # CF Turnstile 在登录表单底部，checkbox 约在窗口水平中央偏左、垂直约75%处
     if not box:
-        print("   >> 自动定位全部失败，固定坐标兜底点击 (630, 563)", flush=True)
         await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_iframe_not_found.png"))
         try:
-            await tab.mouse.click(630, 563, humanize=True)
+            win = await _js(tab, "({w: window.innerWidth, h: window.innerHeight})")
+            win_w = win.get('w', 1280) if isinstance(win, dict) else 1280
+            win_h = win.get('h', 720)  if isinstance(win, dict) else 720
+            # Turnstile checkbox 在页面中央卡片内，水平偏左约30%，垂直约75%
+            cx = int(win_w * 0.30)
+            cy = int(win_h * 0.75)
+            print(f"   >> 自动定位失败，动态坐标兜底 ({cx}, {cy})，窗口={win_w}x{win_h}", flush=True)
+            await tab.mouse.click(cx, cy, humanize=True)
         except Exception as e:
-            print(f"   >> 固定坐标点击失败: {e}", flush=True)
+            print(f"   >> 动态坐标点击失败: {e}", flush=True)
             return False
         for i in range(int(timeout * 2)):
             if await _turnstile_token_ready(tab):
-                print(f"   >> Turnstile token 就绪（固定坐标，{i * 0.5:.1f}s）", flush=True)
+                print(f"   >> Turnstile token 就绪（动态坐标，{i * 0.5:.1f}s）", flush=True)
                 return True
             await asyncio.sleep(0.5)
-        print("   >> 固定坐标点击后 token 超时", flush=True)
+        print("   >> 动态坐标点击后 token 超时", flush=True)
         return False
 
     # 坐标合理性校验：x/y 必须在视口范围内
