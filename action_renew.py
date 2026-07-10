@@ -330,23 +330,23 @@ async def _find_turnstile_box_cdp(tab) -> dict | None:
         box = await _js(tab, """
         (function() {
             var el = document.querySelector('div.cf-turnstile') || document.querySelector('[data-sitekey]');
-            if (!el) return null;
-            // 累加 offsetTop/Left 到根，得到相对于页面顶部的绝对坐标
+            if (!el) return {err: 'no-element', url: window.location.href.substring(0,60)};
             var top = 0, left = 0, cur = el;
             while (cur) {
                 top  += cur.offsetTop  || 0;
                 left += cur.offsetLeft || 0;
                 cur   = cur.offsetParent;
             }
-            // 减去滚动量得到视口坐标
             var viewTop  = top  - window.scrollY;
             var viewLeft = left - window.scrollX;
-            // 宽高：offsetWidth/Height 可能为 0（closed shadow-root），用已知值兜底
             var w = el.offsetWidth  || 0;
             var h = el.offsetHeight || 0;
             return {
                 x:      viewLeft,
                 y:      viewTop,
+                rawTop: top,
+                rawLeft: left,
+                scrollY: window.scrollY,
                 width:  w > 10 ? w : 300,
                 height: h > 10 ? h : 65,
                 winW:   window.innerWidth,
@@ -357,13 +357,21 @@ async def _find_turnstile_box_cdp(tab) -> dict | None:
         """)
 
         if box and isinstance(box, dict):
+            if box.get('err'):
+                print(f"   >> offset诊断: {box}", flush=True)
+                return None
             x = box.get('x', -1)
             y = box.get('y', -1)
-            w = box.get('winW', 0)
-            h = box.get('winH', 0)
-            print(f"   >> offset坐标: x={x:.0f} y={y:.0f} w={box.get('width',0):.0f} h={box.get('height',0):.0f} 窗口={w}x{h}", flush=True)
+            print(f"   >> offset坐标: x={x:.0f} y={y:.0f} raw=({box.get('rawLeft',0):.0f},{box.get('rawTop',0):.0f}) scroll={box.get('scrollY',0):.0f} 窗口={box.get('winW',0)}x{box.get('winH',0)}", flush=True)
             if x >= 0 and y >= 0:
                 return box
+            # y<0 说明元素在视口上方（页面已滚动），用 rawTop 直接作为绝对坐标
+            if box.get('rawTop', 0) > 0:
+                print(f"   >> y<0，用 rawTop={box.get('rawTop',0):.0f} 作绝对坐标", flush=True)
+                return {**box, 'y': box['rawTop'], 'x': box.get('rawLeft', 0)}
+
+        else:
+            print(f"   >> JS返回空: box={box}", flush=True)
 
         return None
     except Exception as e:
@@ -499,9 +507,10 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
             win = await _js(tab, "({w: window.innerWidth, h: window.innerHeight})")
             win_w = win.get('w', 1280) if isinstance(win, dict) else 1280
             win_h = win.get('h', 720)  if isinstance(win, dict) else 720
-            # Turnstile checkbox 在页面中央卡片内，水平偏左约30%，垂直约75%
-            cx = int(win_w * 0.30)
-            cy = int(win_h * 0.75)
+            # 登录卡片宽约420px，居中于窗口；checkbox 在卡片左缘+28px，垂直约78%
+            card_left = (win_w - 420) // 2
+            cx = card_left + 28
+            cy = int(win_h * 0.78)
             print(f"   >> 自动定位失败，动态坐标兜底 ({cx}, {cy})，窗口={win_w}x{win_h}", flush=True)
             await tab.mouse.click(cx, cy, humanize=True)
         except Exception as e:
