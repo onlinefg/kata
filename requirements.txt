@@ -1,1 +1,1 @@
-cloakbrowser>=0.4.1
+cloakbrowser[geoip]>=0.4.1
