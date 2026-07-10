@@ -524,7 +524,16 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
             cx = 152  # checkbox 水平位置固定（登录卡片左侧）
             cy = 390 + addr_bar_h   # 截图内 y=390，加地址栏偏移
             print(f"   >> 自动定位失败，动态坐标兜底 ({cx}, {cy})，窗口={win_w}x{win_h} 地址栏={addr_bar_h}", flush=True)
-            await tab.mouse.click(cx, cy, humanize=True)
+            import random as _rand2
+            sx = cx + _rand2.randint(60, 120)
+            sy = cy - _rand2.randint(80, 130)
+            await tab.mouse.move(sx, sy, humanize=True)
+            await asyncio.sleep(_rand2.uniform(0.2, 0.5))
+            await tab.mouse.move(cx, cy, humanize=True)
+            await asyncio.sleep(_rand2.uniform(0.15, 0.35))
+            await tab.mouse.press(cx, cy)
+            await asyncio.sleep(_rand2.uniform(0.08, 0.18))
+            await tab.mouse.release(cx, cy)
         except Exception as e:
             print(f"   >> 动态坐标点击失败: {e}", flush=True)
             return False
@@ -545,14 +554,24 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
         await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_bad_coords.png"))
         return False
 
-    # 点击 checkbox：CF Turnstile checkbox 在容器/iframe 左侧约 28px，垂直居中
-    # src='cf-turnstile-div' 时容器高度一般 65px，checkbox 在 left+28, top+32
-    # src='cf-iframe-*' 时 iframe 就是整个 Turnstile 区域，checkbox 在 left+28, vcenter
+    # checkbox 在容器左侧约 28px，垂直居中
     x = bx + 28
     y = by + bh / 2
     print(f"   >> 坐标点击 Turnstile checkbox ({x:.0f}, {y:.0f})", flush=True)
     try:
-        await tab.mouse.click(x, y, humanize=True)
+        import random as _rand
+        # 先把鼠标移到密码框附近（自然起点），pydoll humanize=True 走贝塞尔曲线
+        start_x = bx + _rand.randint(60, 120)
+        start_y = by - _rand.randint(80, 130)
+        await tab.mouse.move(start_x, start_y, humanize=True)
+        await asyncio.sleep(_rand.uniform(0.2, 0.5))
+        # 贝塞尔曲线移动到 checkbox
+        await tab.mouse.move(x, y, humanize=True)
+        await asyncio.sleep(_rand.uniform(0.15, 0.35))
+        # press/release 模拟真实点击
+        await tab.mouse.press(x, y)
+        await asyncio.sleep(_rand.uniform(0.08, 0.18))
+        await tab.mouse.release(x, y)
     except Exception as e:
         print(f"   >> ❌ 坐标点击失败: {e}", flush=True)
         await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_click_failed.png"))
