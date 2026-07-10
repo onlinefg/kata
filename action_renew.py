@@ -87,13 +87,35 @@ def _find_chromium() -> str | None:
         pass
     return None
 
+PROXYCHAINS_CHROME = os.getenv("PROXYCHAINS_CHROME", "false").lower() == "true"
+
+def _make_proxychains_wrapper(chrome_path: str) -> str:
+    """
+    生成一个 wrapper shell 脚本，用 proxychains4 启动 Chrome。
+    pydoll 会把这个脚本当作 Chrome binary 来调用，
+    所有流量走 SOCKS5，但 CDP 本地回环不受影响（proxychains 只代理对外连接）。
+    """
+    wrapper = "/tmp/chrome_proxychains.sh"
+    script = f"""#!/bin/bash
+exec proxychains4 -q {chrome_path} "$@"
+"""
+    with open(wrapper, "w") as f:
+        f.write(script)
+    import stat
+    os.chmod(wrapper, os.stat(wrapper).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    print(f"[DEBUG] proxychains wrapper 已创建: {wrapper}", flush=True)
+    return wrapper
+
 def build_options():
     opts = ChromiumOptions()
     opts.headless = HEADLESS
     opts.start_timeout = 30
     path = _find_chromium()
     if path:
-        opts.binary_location = path
+        if PROXYCHAINS_CHROME:
+            opts.binary_location = _make_proxychains_wrapper(path)
+        else:
+            opts.binary_location = path
     else:
         print("⚠️ 未找到 Chromium，使用 pydoll 默认路径", flush=True)
 
@@ -112,10 +134,8 @@ def build_options():
     opts.add_argument("--disable-password-generation")
     opts.add_argument("--password-store=basic")
     opts.add_argument("--use-mock-keychain")
-    if HTTP_PROXY:
-        opts.add_argument(f"--proxy-server={HTTP_PROXY}")
-        # 本地回环必须绕过代理，否则 pydoll 连不上 Chrome CDP 端口
-        opts.add_argument("--proxy-bypass-list=<-loopback>")
+    # 代理由 proxychains4 在进程层面注入，Chrome 本身不加 --proxy-server
+    # 避免 CDP 本地回环也走代理导致 pydoll 连不上 Chrome
     opts.browser_preferences = {
         "credentials_enable_service": False,
         "profile": {
