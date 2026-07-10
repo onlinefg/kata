@@ -23,20 +23,26 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装依赖
-        run: |
-          sudo apt-get update -qq
-          curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb
-          sudo apt-get install -y -qq /tmp/chrome.deb
-          sudo apt-get install -y -qq xvfb curl ffmpeg unzip proxychains4
-
-      - name: 安装 Python
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb ffmpeg curl unzip \
+            fonts-noto-cjk \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+            libxfixes3 libxrandr2 libgbm1 \
+            libasound2t64 || sudo apt-get install -y -qq libasound2
+
       - name: 安装 Python 依赖
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          python -c "from cloakbrowser import ensure_binary; ensure_binary()"
 
       - name: 下载并启动 Xray 代理
         env:
@@ -54,66 +60,59 @@ jobs:
           curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me || echo "(代理超时，请检查 V2RAY_CONFIG)"
           echo ""
 
-      - name: 配置 proxychains4
-        run: |
-          sudo tee /etc/proxychains4.conf > /dev/null << 'PCEOF'
-          quiet_mode
-          dynamic_chain
-          proxy_dns
-          tcp_read_time_out 15000
-          tcp_connect_time_out 8000
-          [ProxyList]
-          socks5 127.0.0.1 10808
-          PCEOF
-
-      - name: 修复 DNS
-        run: |
-          sudo systemctl stop systemd-resolved 2>/dev/null || true
-          sudo rm -f /etc/resolv.conf
-          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf
-          sudo chattr +i /etc/resolv.conf 2>/dev/null || true
-          sleep 2
-
-      - name: 运行续期（带录屏）
+      - name: 运行续期
         env:
           USERS_JSON: ${{ secrets.USERS_JSON }}
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
           WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
-          HEADLESS: "false"
           DISPLAY: ":99"
-          ENABLE_RECORDING: ${{ github.event.inputs.ENABLE_RECORDING || 'false' }}
-          # Chrome 由 proxychains 启动，Python 本身不需要 HTTP_PROXY
-          PROXYCHAINS_CHROME: "true"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          GALLIUM_DRIVER: "llvmpipe"
+          ENABLE_RECORDING: ${{ github.event.inputs.ENABLE_RECORDING }}
         run: |
-          export DISPLAY=:99
+          if [ "$ENABLE_RECORDING" = "true" ]; then
+            DO_RECORD=true
+            echo "📹 录屏已开启"
+          else
+            DO_RECORD=false
+            echo "📹 录屏已关闭"
+          fi
+
           Xvfb :99 -screen 0 1280x720x24 +extension RANDR &
-          sleep 1
-          if [ "$ENABLE_RECORDING" = "true" ]; then
-            ffmpeg -f x11grab -video_size 1280x720 -i :99 \
-              -codec:v libx264 -preset ultrafast -crf 30 -t 180 \
-              -movflags +faststart -y /tmp/recording.mp4 &
+          XVFB_PID=$!
+          sleep 2
+          DISPLAY=:99 xdpyinfo > /dev/null 2>&1 && echo "Xvfb 就绪" || echo "Xvfb 启动异常"
+
+          RECORD_PID=""
+          if [ "$DO_RECORD" = "true" ]; then
+            ffmpeg -f x11grab -video_size 1280x720 -framerate 15 -i :99 \
+              -codec:v libx264 -preset ultrafast -crf 28 \
+              -pix_fmt yuv420p -movflags +faststart /tmp/recording.mp4 \
+              > /tmp/ffmpeg.log 2>&1 &
             RECORD_PID=$!
-            sleep 1
+            sleep 3
+            echo "录屏 PID: $RECORD_PID"
           fi
-          timeout 150 python action_renew.py || echo "[EXIT] $?"
-          if [ "$ENABLE_RECORDING" = "true" ]; then
-            kill -INT $RECORD_PID 2>/dev/null || true
-            for i in $(seq 1 10); do
-              kill -0 $RECORD_PID 2>/dev/null || break
-              sleep 1
-            done
-            kill -9 $RECORD_PID 2>/dev/null || true
+
+          timeout 270 python -u action_renew.py || echo "脚本退出码: $?"
+
+          echo "=== 截图目录 ==="
+          ls -la ./screenshots/ || echo "(无截图)"
+
+          if [ -n "$RECORD_PID" ]; then
+            sleep 2
+            kill $RECORD_PID 2>/dev/null || true
             wait $RECORD_PID 2>/dev/null || true
-            ls -la /tmp/recording.mp4 || true
+            stat -c"录像大小: %s bytes" /tmp/recording.mp4 2>/dev/null || true
           fi
-          pkill Xvfb 2>/dev/null || true
+          kill $XVFB_PID 2>/dev/null || true
 
       - name: 上传截图
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots
-          path: ./screenshots/
+          name: screenshots-${{ github.run_number }}
+          path: ./screenshots/*.png
           if-no-files-found: ignore
           retention-days: 3
 
@@ -121,8 +120,10 @@ jobs:
         if: always() && github.event.inputs.ENABLE_RECORDING == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: recording
-          path: /tmp/recording.mp4
+          name: recording-${{ github.run_number }}
+          path: |
+            /tmp/recording.mp4
+            /tmp/ffmpeg.log
           if-no-files-found: ignore
           retention-days: 3
 
@@ -130,25 +131,22 @@ jobs:
     runs-on: ubuntu-latest
     needs: renew
     if: always()
-    permissions:
-      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: 删除旧的 workflow runs，保留最新 2 个
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'renew.yml',
-              per_page: 100,
-            });
-            const toDelete = runs.slice(2);
-            for (const run of toDelete) {
-              await github.rest.actions.deleteWorkflowRun({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: run.id,
-              });
-              console.log(`Deleted run #${run.run_number} (id: ${run.id})`);
-            }
+      - name: 删除旧 runs，保留最新 2 个
+        run: |
+          REPO="${{ github.repository }}"
+          WORKFLOW="renew.yml"
+          WORKFLOW_ID=$(gh api "repos/${REPO}/actions/workflows" \
+            --jq ".workflows[] | select(.path | endswith(\"${WORKFLOW}\")) | .id")
+          if [ -z "$WORKFLOW_ID" ]; then echo "未找到 workflow，跳过"; exit 0; fi
+          RUN_IDS=$(gh api \
+            "repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs?per_page=100" \
+            --jq '.workflow_runs | sort_by(.run_number) | reverse | .[2:] | .[].id')
+          if [ -z "$RUN_IDS" ]; then echo "无需清理"; exit 0; fi
+          for RUN_ID in $RUN_IDS; do
+            echo "删除 run: $RUN_ID"
+            gh api -X DELETE "repos/${REPO}/actions/runs/${RUN_ID}" || echo "跳过 $RUN_ID"
+          done
+          echo "✅ 清理完成"
