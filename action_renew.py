@@ -1,51 +1,37 @@
 """
-Katabump 自动续期 — pydoll 原生 CF bypass 版
-- WxPusher 通知
-- 多账号整合报告，含下次续期时间
-- 录屏结束后停留 3 秒
-- 修复通知消息截断问题
+Katabump 自动续期 — CloakBrowser 版
+- CF Turnstile 先等自动通过，过不去再坐标点击（移植自 runfc）
+- ALTCHA modal JS 点击
+- 多账号 USERS_JSON，WxPusher 通知
 """
-import sys
-print("[DEBUG] 导入中...", flush=True)
-
-import asyncio
-import json
-import os
-import traceback
+import os, re, json, time, random, logging, sys
 from pathlib import Path
 
-import httpx
-from pydoll.browser.chromium import Chrome
-from pydoll.browser.options import ChromiumOptions
-print("[DEBUG] 导入完成", flush=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
 
+PROXY_SERVER       = "socks5://127.0.0.1:10808"
 WXPUSHER_APP_TOKEN = os.getenv("WXPUSHER_APP_TOKEN", "")
 WXPUSHER_UID       = os.getenv("WXPUSHER_UID", "")
-HTTP_PROXY         = os.getenv("HTTP_PROXY", "")
-HEADLESS           = os.getenv("HEADLESS", "false").lower() == "true"
-SHOT_DIR           = Path("./screenshots")
+SCREENSHOT_DIR     = Path("./screenshots")
+SCREENSHOT_DIR.mkdir(exist_ok=True)
 
-# ----- WxPusher 通知 -----
-async def send_wxpusher(text: str):
-    print(f"   [WxPusher] APP_TOKEN={'set' if WXPUSHER_APP_TOKEN else 'missing'}  UID={'set' if WXPUSHER_UID else 'missing'}", flush=True)
-    if not WXPUSHER_APP_TOKEN or not WXPUSHER_UID:
-        print("   >> WxPusher 未配置，跳过通知", flush=True)
-        return
-    url = "https://wxpusher.zjiecode.com/api/send/message"
-    payload = {
-        "appToken": WXPUSHER_APP_TOKEN,
-        "content": text,
-        "contentType": 1,
-        "uids": [WXPUSHER_UID],
-    }
-    async with httpx.AsyncClient(timeout=10) as c:
-        try:
-            resp = await c.post(url, json=payload)
-            print(f"   >> WxPusher 状态码: {resp.status_code}, 响应: {resp.text}", flush=True)
-        except Exception as e:
-            print(f"   >> WxPusher 异常: {e}", flush=True)
+BASE_URL   = "https://dashboard.katabump.com"
+LOGIN_URL  = f"{BASE_URL}/auth/login"
+LOGOUT_URL = f"{BASE_URL}/auth/logout"
 
-# ----- 用户加载 -----
+# ---------- 工具 ----------
+def mask_email(email: str) -> str:
+    if not email or "@" not in email:
+        return "***"
+    local, domain = email.split("@", 1)
+    parts = domain.split(".")
+    return f"{local[0]}***@{parts[0][0]}***.{'.'.join(parts[1:])}"
+
+def mask_sid(sid) -> str:
+    s = str(sid)
+    return s[:2] + "***" if len(s) > 2 else "***"
+
 def load_users():
     raw = os.getenv("USERS_JSON", "")
     if not raw:
@@ -57,804 +43,592 @@ def load_users():
         if isinstance(data, dict) and "users" in data:
             return data["users"]
     except Exception:
-        return []
-
-# ----- Chromium 路径探测 -----
-def _find_chromium() -> str | None:
-    candidates = [
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/google-chrome",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/snap/bin/chromium",
-    ]
-    for p in candidates:
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            print(f"[DEBUG] 找到 Chromium: {p}", flush=True)
-            return p
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["which", "chromium-browser", "chromium", "google-chrome"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.strip().splitlines():
-            line = line.strip()
-            if line and os.path.isfile(line):
-                print(f"[DEBUG] which 找到: {line}", flush=True)
-                return line
-    except Exception:
         pass
-    return None
+    return []
 
-PROXYCHAINS_CHROME = os.getenv("PROXYCHAINS_CHROME", "false").lower() == "true"
-
-def _make_proxychains_wrapper(chrome_path: str) -> str:
-    """
-    生成一个 wrapper shell 脚本，用 proxychains4 启动 Chrome。
-    pydoll 会把这个脚本当作 Chrome binary 来调用，
-    所有流量走 SOCKS5，但 CDP 本地回环不受影响（proxychains 只代理对外连接）。
-    """
-    wrapper = "/tmp/chrome_proxychains.sh"
-    script = f"""#!/bin/bash
-exec proxychains4 -q {chrome_path} "$@"
-"""
-    with open(wrapper, "w") as f:
-        f.write(script)
-    import stat
-    os.chmod(wrapper, os.stat(wrapper).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    print(f"[DEBUG] proxychains wrapper 已创建: {wrapper}", flush=True)
-    return wrapper
-
-def build_options():
-    opts = ChromiumOptions()
-    opts.headless = HEADLESS
-    opts.start_timeout = 30
-    path = _find_chromium()
-    if path:
-        if PROXYCHAINS_CHROME:
-            opts.binary_location = _make_proxychains_wrapper(path)
-        else:
-            opts.binary_location = path
-    else:
-        print("⚠️ 未找到 Chromium，使用 pydoll 默认路径", flush=True)
-
-    opts.add_argument("--window-size=1280,720")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-setuid-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-features=VizDisplayCompositor")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-background-timer-throttling")
-    opts.add_argument("--disable-backgrounding-occluded-windows")
-    opts.add_argument("--disable-renderer-backgrounding")
-    opts.add_argument("--disable-save-password-bubble")
-    opts.add_argument("--disable-password-generation")
-    opts.add_argument("--password-store=basic")
-    opts.add_argument("--use-mock-keychain")
-    # 代理由 proxychains4 在进程层面注入，Chrome 本身不加 --proxy-server
-    # 避免 CDP 本地回环也走代理导致 pydoll 连不上 Chrome
-    opts.browser_preferences = {
-        "credentials_enable_service": False,
-        "profile": {
-            "password_manager_enabled": False,
-            "default_content_setting_values": {
-                "notifications": 2,
-                "geolocation": 2,
-            },
-        },
-    }
-    return opts
-
-# ----- JS 执行 -----
-async def _js(tab, expression: str):
-    raw = await tab.execute_script(f"return ({expression});")
-    if isinstance(raw, dict):
-        try:
-            inner = raw.get("result", {}).get("result", {})
-            if "value" in inner:
-                return inner["value"]
-            if "value" in raw.get("result", {}):
-                return raw["result"]["value"]
-        except Exception:
-            pass
-        return str(raw)
-    return raw
-
-# ----- 工具函数 -----
-async def get_url(tab) -> str:
+def wxpush(content: str):
+    if not WXPUSHER_APP_TOKEN or not WXPUSHER_UID:
+        log.warning("WxPusher 未配置，跳过")
+        return
+    import urllib.request
+    payload = json.dumps({
+        "appToken": WXPUSHER_APP_TOKEN,
+        "content": content,
+        "contentType": 1,
+        "uids": [WXPUSHER_UID],
+    }).encode()
     try:
-        return str(await _js(tab, "window.location.href"))
+        req = urllib.request.Request(
+            "https://wxpusher.zjiecode.com/api/send/message",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            if result.get("success"):
+                log.info("📨 WxPusher 推送成功")
+            else:
+                log.warning(f"📨 WxPusher 失败: {result}")
+    except Exception as e:
+        log.warning(f"📨 WxPusher 异常: {e}")
+
+def take_screenshot(page, name: str):
+    try:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = str(SCREENSHOT_DIR / f"{ts}_{name}.png")
+        page.screenshot(path=path, full_page=False)
+        log.info(f"📸 {path}")
+    except Exception as e:
+        log.warning(f"截图失败: {e}")
+
+def get_text(page) -> str:
+    try:
+        return page.inner_text("body") or ""
     except Exception:
         return ""
 
-async def page_has_text(tab, text: str) -> bool:
+def human_delay(min_s=0.3, max_s=0.8):
+    time.sleep(random.uniform(min_s, max_s))
+
+def js_eval(page, expr: str):
     try:
-        result = await _js(
-            tab,
-            f"document.body && document.body.innerText && document.body.innerText.includes({json.dumps(text)})"
+        return page.evaluate(f"() => {{ {expr} }}")
+    except Exception as e:
+        log.warning(f"js_eval 失败: {e}")
+        return None
+
+# ---------- CF Turnstile ----------
+def is_cf_blocked(page) -> bool:
+    try:
+        has_widget = page.evaluate("""() => !!(
+            document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+            document.querySelector('input[name="cf-turnstile-response"]') ||
+            document.querySelector('.cf-turnstile') ||
+            document.querySelector('#challenge-stage') ||
+            document.querySelector('#cf-wrapper')
+        )""")
+        if has_widget:
+            return True
+    except Exception:
+        pass
+    try:
+        body = get_text(page).lower()
+        return "verify you are human" in body or "ray id" in body or (
+            "cloudflare" in body and "security" in body
         )
-        return result is True or str(result).lower() == "true"
     except Exception:
         return False
 
-async def take_screenshot(browser, tab, path: str):
-    """pydoll 2.23 的正确方法名是 take_screenshot（不是 screenshot），
-    且没有 tab._connection / tab.connection 这种属性（实际是
-    tab._connection_handler），所以旧版本两条分支永远静默失败，
-    从未真正写出过文件。这里直接调用官方 API，并把异常打印出来，
-    避免以后再次"静默无截图"。"""
-    try:
-        await tab.take_screenshot(path)
-        print(f"   >> 📸 截图已保存: {path}", flush=True)
-    except Exception as e:
-        print(f"   >> ⚠️ 截图失败 path={path}: {e!r}", flush=True)
+def wait_cf_pass(page, timeout=45) -> bool:
+    log.info("等待 CF 自动通过...")
+    for i in range(timeout):
+        if not is_cf_blocked(page):
+            log.info(f"✅ CF 自动通过（{i}s）")
+            return True
+        if i % 5 == 0 and i > 0:
+            log.info(f"  CF 等待中... {i}s")
+        time.sleep(1)
+    return False
 
-# ----- 获取下次续期时间（从页面抓取 Expiry）-----
-async def _get_next_renew_time(tab) -> str:
-    """从页面提取 Expiry 和 Renew period，返回可读字符串"""
+def _find_stable_cf_frame(page, stable_timeout=12):
+    """连续 2 次 bounding_box 一致才返回，避免拿到正在被 CF 替换的旧 frame"""
+    deadline = time.time() + stable_timeout
+    while time.time() < deadline:
+        cf_frame = None
+        for f in page.frames:
+            if "challenges.cloudflare.com" in (f.url or ""):
+                cf_frame = f
+                break
+        if not cf_frame:
+            time.sleep(0.3)
+            continue
+        try:
+            box1 = cf_frame.frame_element().bounding_box()
+        except Exception as e:
+            log.warning(f"  [稳定检测] frame_element 失败: {e}")
+            time.sleep(0.3)
+            continue
+        if not box1:
+            time.sleep(0.3)
+            continue
+        time.sleep(0.3)
+        try:
+            box2 = cf_frame.frame_element().bounding_box()
+        except Exception:
+            time.sleep(0.3)
+            continue
+        if box2 and abs(box2["y"] - box1["y"]) < 5:
+            log.info(f"  ✅ CF frame 稳定 box={box2}")
+            return cf_frame, box2
+        log.warning(f"  [稳定检测] 位置漂移 {box1} -> {box2}")
+        time.sleep(0.3)
+    return None, None
+
+def click_cf_checkbox(page, timeout=45) -> bool:
+    """找稳定 CF frame → 坐标点击 → 等待登录页就绪"""
+    def login_ready() -> bool:
+        try:
+            return page.locator(
+                'input[name="email"], input[type="email"]'
+            ).first.is_visible(timeout=500)
+        except Exception:
+            return False
+
+    log.info("【CF】查找稳定 CF iframe...")
+    frames = page.frames
+    log.info(f"  当前 {len(frames)} 个 frame：" +
+             " | ".join((f.url or "about:blank")[:80] for f in frames[:5]))
+
+    cf_frame, box = _find_stable_cf_frame(page, stable_timeout=12)
+
+    if not cf_frame or not box:
+        log.warning("【CF】未找到稳定 CF frame，坐标点击跳过")
+        take_screenshot(page, "cf_no_frame")
+        return False
+
+    x = box["x"] + 25
+    y = box["y"] + box["height"] / 2
     try:
-        info = await _js(tab, """
-            (function() {
-                const lines = document.body.innerText.split('\\n');
-                let expiry = null, period = null;
-                for (let i = 0; i < lines.length; i++) {
-                    if (lines[i].includes('Expiry')) {
-                        expiry = lines[i].replace('Expiry', '').trim();
-                    }
-                    if (lines[i].includes('Renew period')) {
-                        const nextLine = lines[i+1] || '';
-                        period = nextLine.trim();
-                    }
-                }
-                if (expiry && period) {
-                    return JSON.stringify({ expiry, period });
-                }
-                return null;
-            })()
-        """)
-        if info and isinstance(info, str) and info != "null":
-            data = json.loads(info)
-            expiry = data.get("expiry", "")
-            period = data.get("period", "")
+        page.mouse.move(x, y)
+        time.sleep(random.uniform(0.2, 0.4))
+        page.mouse.click(x, y)
+        log.info(f"  ✅ 坐标点击 ({x:.0f}, {y:.0f})")
+    except Exception as e:
+        log.warning(f"  坐标点击失败: {e}")
+        take_screenshot(page, "cf_click_failed")
+        return False
+
+    take_screenshot(page, "cf_clicked")
+    log.info(f"【CF】等待登录页（最多 {timeout}s）...")
+    for i in range(timeout * 2):
+        if login_ready():
+            log.info(f"  ✅ 登录页就绪（{i * 0.5:.1f}s）")
+            return True
+        if i % 10 == 0 and i > 0:
+            take_screenshot(page, f"cf_wait_{i}")
+        time.sleep(0.5)
+
+    log.error("【CF】等待超时")
+    take_screenshot(page, "cf_timeout")
+    return False
+
+def wait_for_page_settle(page, settle_timeout=10):
+    deadline = time.time() + settle_timeout
+    while time.time() < deadline:
+        try:
+            body = page.inner_text("body") or ""
+        except Exception:
+            body = ""
+        if is_cf_blocked(page):
+            log.info("  页面稳定（CF 就绪）")
+            return
+        if len(body.strip()) > 100:
+            log.info("  页面稳定（内容就绪）")
+            return
+        time.sleep(0.5)
+    log.info("  页面稳定等待超时，继续...")
+
+def navigate(page, url) -> bool:
+    log.info(f"导航: {url}")
+    try:
+        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+    except Exception as e:
+        log.warning(f"goto 异常: {e}，继续...")
+
+    wait_for_page_settle(page, settle_timeout=12)
+
+    if not is_cf_blocked(page):
+        return True
+
+    # 先等自动通过（Managed Challenge 通常 20-35s）
+    if wait_cf_pass(page, timeout=40):
+        return True
+
+    # 自动没过，坐标点击
+    log.info("CF 被动未通过，尝试坐标点击...")
+    if click_cf_checkbox(page, timeout=45):
+        return True
+
+    # 最后刷新兜底
+    log.info("坐标点击未过，刷新兜底...")
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+    except Exception:
+        pass
+    if not is_cf_blocked(page):
+        return True
+    if wait_cf_pass(page, timeout=30):
+        return True
+    return click_cf_checkbox(page, timeout=30)
+
+# ---------- ALTCHA modal ----------
+def solve_altcha_in_modal(page) -> bool:
+    log.info("  >> 处理 modal 内 ALTCHA...")
+    # 等 altcha-widget 出现
+    for _ in range(20):
+        exists = page.evaluate(
+            "() => !!document.querySelector('#renew-modal altcha-widget')"
+        )
+        if exists:
+            break
+        time.sleep(0.5)
+    else:
+        log.warning("  >> modal 内未发现 ALTCHA")
+        return False
+
+    for attempt in range(1, 6):
+        log.info(f"  >> ALTCHA JS 点击 {attempt}/5")
+        clicked = page.evaluate("""() => {
+            const cb = document.querySelector('#renew-modal altcha-widget input[type="checkbox"]');
+            if (!cb) return false;
+            cb.focus();
+            cb.click();
+            cb.dispatchEvent(new Event('input', {bubbles: true}));
+            cb.dispatchEvent(new Event('change', {bubbles: true}));
+            return true;
+        }""")
+        if not clicked:
+            time.sleep(1)
+            continue
+
+        for _ in range(12):
+            time.sleep(1)
+            state = page.evaluate("""() => {
+                const w = document.querySelector('#renew-modal altcha-widget .altcha');
+                if (!w) return 'no-widget';
+                return w.getAttribute('data-state') || 'unknown';
+            }""")
+            log.info(f"  >> ALTCHA state={state}")
+            if state == "verified":
+                log.info("  >> ✅ ALTCHA verified")
+                page.evaluate("""() => {
+                    const modal = document.querySelector('#renew-modal');
+                    if (!modal) return;
+                    const btn = modal.querySelector('button[type="submit"]');
+                    if (btn) setTimeout(() => btn.click(), 300);
+                }""")
+                time.sleep(2)
+                return True
+            if state == "error":
+                log.warning("  >> ALTCHA error，重试")
+                break
+        time.sleep(0.5)
+
+    log.error("  >> ALTCHA 多次失败")
+    return False
+
+# ---------- 获取下次续期时间 ----------
+def get_next_renew_time(page) -> str:
+    try:
+        info = page.evaluate("""() => {
+            const lines = document.body.innerText.split('\\n');
+            let expiry = null, period = null;
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].includes('Expiry'))
+                    expiry = lines[i].replace('Expiry', '').trim();
+                if (lines[i].includes('Renew period'))
+                    period = (lines[i+1] || '').trim();
+            }
+            if (expiry) return JSON.stringify({expiry, period});
+            return null;
+        }""")
+        if info and info != "null":
+            d = json.loads(info)
+            expiry = d.get("expiry", "")
+            period = d.get("period", "")
             if expiry:
-                return f"到期日: {expiry} (周期: {period})" if period else f"到期日: {expiry}"
+                return f"到期日: {expiry}" + (f" (周期: {period})" if period else "")
     except Exception:
         pass
 
-    # 备选：用正则从页面文本中找日期（如 "expires on 20 May 2025" 等格式）
+    # 正则兜底
     try:
-        fallback = await _js(tab, r"""
-            (function() {
-                const t = document.body.innerText;
-                const m = t.match(/expir\w*\s*[:\-]?\s*([\d]{1,2}\s+\w+\s+\d{4}|\w+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})/i);
-                return m ? m[1].trim() : null;
-            })()
-        """)
-        if fallback and fallback != "null" and isinstance(fallback, str):
-            return f"到期日: {fallback}"
+        body = get_text(page)
+        m = re.search(
+            r'expir\w*\s*[:\-]?\s*([\d]{1,2}\s+\w+\s+\d{4}|\w+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})',
+            body, re.I
+        )
+        if m:
+            return f"到期日: {m.group(1).strip()}"
     except Exception:
         pass
 
     return "续期成功（未能获取具体时间）"
 
-# ----- ALTCHA JS 点击 -----
-async def solve_altcha_in_modal(tab) -> bool:
-    print("   >> 开始处理 modal 内 ALTCHA...", flush=True)
-    for _ in range(20):
-        exists = await _js(tab, "!!document.querySelector('#renew-modal altcha-widget')")
-        if exists is True or str(exists).lower() == "true":
-            break
-        await asyncio.sleep(0.5)
-    else:
-        print("   >> 未在 modal 内发现 ALTCHA", flush=True)
-        return False
-
-    for attempt in range(1, 6):
-        print(f"   >> ALTCHA JS 点击尝试 {attempt}/5", flush=True)
-        clicked = await _js(tab, """
-            (function() {
-                const cb = document.querySelector('#renew-modal altcha-widget input[type="checkbox"]');
-                if (!cb) return false;
-                cb.focus();
-                cb.click();
-                cb.dispatchEvent(new Event('input', {bubbles: true}));
-                cb.dispatchEvent(new Event('change', {bubbles: true}));
-                return true;
-            })()
-        """)
-        print(f"   >> JS click 返回值: {clicked}", flush=True)
-        if not clicked or clicked == "false":
-            await asyncio.sleep(1)
-            continue
-
-        for _ in range(12):
-            await asyncio.sleep(1)
-            state = await _js(tab, """
-                (function() {
-                    const w = document.querySelector('#renew-modal altcha-widget .altcha');
-                    if (!w) return 'no-widget';
-                    return w.getAttribute('data-state') || 'unknown';
-                })()
-            """)
-            print(f"   >> ALTCHA state = {state}", flush=True)
-            if state == "verified":
-                print("   >> ✅ ALTCHA verified", flush=True)
-                await _js(tab, """
-                    (function() {
-                        const modal = document.querySelector('#renew-modal');
-                        if (!modal) return;
-                        const btn = modal.querySelector('button[type="submit"]');
-                        if (btn) {
-                            btn.focus();
-                            setTimeout(() => btn.click(), 300);
-                        }
-                    })()
-                """)
-                await asyncio.sleep(2)
-                return True
-            if state == "error":
-                print("   >> ❌ ALTCHA error", flush=True)
-                break
-        await asyncio.sleep(0.5)
-    print("   >> ❌ ALTCHA 多次点击失败", flush=True)
-    return False
-
-async def handle_captcha(tab, is_renew: bool) -> bool:
-    if is_renew:
-        raw = await _js(tab, "!!document.querySelector('#renew-modal altcha-widget')")
-        if raw is True or str(raw).lower() == "true":
-            return await solve_altcha_in_modal(tab)
-    return True
-
-# ----- 登录页 Cloudflare Turnstile 勾选框点击（坐标点击思路，参考 Zytrano）-----
-async def _turnstile_token_ready(tab) -> bool:
-    """检测 cf-turnstile-response 是否已写入 token（穿透 shadow DOM）"""
-    val = await _js(tab, """
-        (function() {
-            function deepQuery(root, sel) {
-                let el = root.querySelector(sel);
-                if (el) return el;
-                for (const host of root.querySelectorAll('*')) {
-                    if (host.shadowRoot) {
-                        el = deepQuery(host.shadowRoot, sel);
-                        if (el) return el;
-                    }
-                }
-                return null;
-            }
-            const el = deepQuery(document, 'input[name="cf-turnstile-response"]');
-            return el ? (el.value || '').length > 10 : false;
-        })()
-    """)
-    return val is True or str(val).lower() == "true"
-
-async def _dump_frames(tab, label: str):
-    """打印当前所有 frame URL，用于诊断 Turnstile 找不到的情况"""
-    try:
-        frames = await tab.get_frames()
-        print(f"   [诊断/{label}] 共 {len(frames)} 个 frame：", flush=True)
-        for i, f in enumerate(frames):
-            url = (getattr(f, 'url', '') or 'about:blank')[:120]
-            print(f"     [{i}] {url}", flush=True)
-    except Exception as e:
-        print(f"   [诊断/{label}] dump_frames 失败: {e}", flush=True)
-
-
-async def _find_turnstile_box_cdp(tab) -> dict | None:
-    """
-    用 JS 累加 offsetTop/offsetLeft 获取 div.cf-turnstile 的绝对坐标。
-    不依赖 get_frames()（pydoll Tab 不支持），不进入 shadow DOM。
-    div.cf-turnstile 容器本身在主文档 DOM 里，offsetTop/Left 是准确的。
-    """
-    try:
-        # 用 JSON.stringify 返回，避免 CDP objectId 问题（pydoll 对象返回值无法直接解析）
-        raw_str = await _js(tab, """
-        JSON.stringify((function() {
-            var el = document.querySelector('div.cf-turnstile') || document.querySelector('[data-sitekey]');
-            if (!el) return {err: 'no-element', url: window.location.href.substring(0,60)};
-            var top = 0, left = 0, cur = el;
-            while (cur) {
-                top  += cur.offsetTop  || 0;
-                left += cur.offsetLeft || 0;
-                cur   = cur.offsetParent;
-            }
-            var viewTop  = top  - window.scrollY;
-            var viewLeft = left - window.scrollX;
-            var w = el.offsetWidth  || 0;
-            var h = el.offsetHeight || 0;
-            return {
-                x:      viewLeft,
-                y:      viewTop,
-                rawTop: top,
-                rawLeft: left,
-                scrollY: window.scrollY,
-                width:  w > 10 ? w : 300,
-                height: h > 10 ? h : 65,
-                winW:   window.innerWidth,
-                winH:   window.innerHeight,
-                src:    'offset-accumulated'
-            };
-        })())
-        """)
-
-        import json as _json
-        try:
-            box = _json.loads(raw_str) if isinstance(raw_str, str) else None
-        except Exception:
-            box = None
-
-        if box and isinstance(box, dict):
-            if box.get('err'):
-                print(f"   >> offset诊断: {box}", flush=True)
-                return None
-            x = box.get('x', -1)
-            y = box.get('y', -1)
-            print(f"   >> offset坐标: x={x:.0f} y={y:.0f} raw=({box.get('rawLeft',0):.0f},{box.get('rawTop',0):.0f}) scroll={box.get('scrollY',0):.0f} 窗口={box.get('winW',0)}x{box.get('winH',0)}", flush=True)
-            if x >= 0 and y >= 0:
-                return box
-            if box.get('rawTop', 0) > 0:
-                print(f"   >> y<0，用 rawTop={box.get('rawTop',0):.0f}", flush=True)
-                return {**box, 'y': box['rawTop'], 'x': box.get('rawLeft', 0)}
-        else:
-            print(f"   >> JS解析失败: raw_str={str(raw_str)[:100]}", flush=True)
-
-        return None
-    except Exception as e:
-        print(f"   >> offset定位失败: {e}", flush=True)
-        return None
-
-async def _find_turnstile_box_js(tab) -> dict | None:
-    """
-    穿透 Shadow DOM 递归查找 Turnstile iframe/容器坐标。
-    CF Turnstile 将 iframe 注入到 div.cf-turnstile 的 closed shadow-root 里，
-    document.querySelectorAll('iframe') 无法找到它。
-    策略：
-      1. div.cf-turnstile 容器坐标（外层有时有真实尺寸）
-      2. 递归穿透所有 shadowRoot 找 iframe[src*=challenges]
-      3. 递归穿透所有 shadowRoot 找任意 iframe（尺寸匹配）
-    """
-    js = """
-    JSON.stringify((function() {
-        // 递归穿透 shadow DOM，收集所有元素
-        function deepQueryAll(root, sel) {
-            var results = [];
-            try {
-                var direct = root.querySelectorAll(sel);
-                for (var i = 0; i < direct.length; i++) results.push(direct[i]);
-                var all = root.querySelectorAll('*');
-                for (var j = 0; j < all.length; j++) {
-                    var sr = all[j].shadowRoot;
-                    if (sr) {
-                        var inner = deepQueryAll(sr, sel);
-                        for (var k = 0; k < inner.length; k++) results.push(inner[k]);
-                    }
-                }
-            } catch(e) {}
-            return results;
-        }
-
-        function rectOf(el) {
-            var r = el.getBoundingClientRect();
-            if (r.width > 0 && r.height > 0)
-                return {x: r.left, y: r.top, width: r.width, height: r.height};
-            return null;
-        }
-
-        // Layer 1: div.cf-turnstile 容器本身（有时外层就有尺寸）
-        var containers = deepQueryAll(document, 'div.cf-turnstile, [data-sitekey]');
-        for (var i = 0; i < containers.length; i++) {
-            var r = rectOf(containers[i]);
-            if (r) { r.src = 'shadow-cf-turnstile-div'; return r; }
-        }
-
-        // Layer 2: 穿透 shadow DOM 找 CF iframe（src 含 challenges）
-        var iframes = deepQueryAll(document, 'iframe');
-        for (var i = 0; i < iframes.length; i++) {
-            var src = iframes[i].src || iframes[i].getAttribute('src') || '';
-            if (src.indexOf('challenges.cloudflare.com') !== -1 ||
-                src.indexOf('turnstile') !== -1) {
-                var r = rectOf(iframes[i]);
-                if (r) { r.src = 'shadow-cf-iframe'; return r; }
-            }
-        }
-
-        // Layer 3: 穿透 shadow DOM 找尺寸匹配的任意 iframe
-        for (var i = 0; i < iframes.length; i++) {
-            var r2 = iframes[i].getBoundingClientRect();
-            if (r2.width >= 200 && r2.width <= 450 && r2.height >= 50) {
-                return {x: r2.left, y: r2.top, width: r2.width, height: r2.height,
-                        src: 'shadow-iframe-size', iframe_src: (iframes[i].src||'').substring(0,60)};
-            }
-        }
-
-        // 诊断：返回找到的所有 iframe 信息
-        var info = [];
-        for (var i = 0; i < iframes.length; i++) {
-            var r3 = iframes[i].getBoundingClientRect();
-            info.push({src:(iframes[i].src||'').substring(0,60), w:Math.round(r3.width), h:Math.round(r3.height)});
-        }
-        return {debug: true, iframes: info, containers: containers.length};
-    })())
-    """
-    import json as _json2
-    try:
-        raw_str2 = await _js(tab, js)
-        box = _json2.loads(raw_str2) if isinstance(raw_str2, str) else None
-        if box and isinstance(box, dict):
-            if box.get("debug"):
-                print(f"   >> Shadow DOM 诊断: iframes={box.get('iframes')}, cf-turnstile容器数={box.get('containers')}", flush=True)
-                return None
-            if box.get("width", 0) > 0:
-                print(f"   >> Turnstile 定位成功（{box.get('src','?')}）: x={box.get('x'):.0f} y={box.get('y'):.0f} w={box.get('width'):.0f} h={box.get('height'):.0f}", flush=True)
-                return box
-        else:
-            print(f"   >> JS Shadow DOM raw: {str(raw_str2)[:80]}", flush=True)
-    except Exception as e:
-        print(f"   >> JS 查找 Turnstile 失败: {e}", flush=True)
-    return None
-
-
-async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> bool:
-    """
-    登录页 Cloudflare Turnstile 勾选框点击。
-    策略：
-      1. 先静默等待 3s，看 token 是否自动写入（invisible 模式无需点击）
-      2. JS 递归遍历所有 iframe，找 challenges.cloudflare.com 坐标（可穿透嵌套层）
-      3. 坐标合理性校验 → 点击 checkbox 左侧区域
-      4. 点击后轮询等待 token 写入
-    """
-    print("   >> 检测登录页 Turnstile 勾选框...", flush=True)
-
-    # 阶段1：静默等待，看是否已自动通过（invisible 模式）
-    for _ in range(6):
-        if await _turnstile_token_ready(tab):
-            print("   >> ✅ Turnstile 已自动通过，无需点击", flush=True)
-            return True
-        await asyncio.sleep(0.5)
-
-    # 阶段2：CDP frame tree 优先（能穿透 closed shadow DOM），JS 作 fallback
-    box = None
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
-        # 先用 CDP（最可靠，能看到 closed shadow-root 里的 iframe）
-        box = await _find_turnstile_box_cdp(tab)
-        if box:
-            print(f"   >> [CDP] 找到 Turnstile: {box}", flush=True)
-            break
-        # CDP 失败再试 JS（open shadow DOM 降级场景）
-        box = await _find_turnstile_box_js(tab)
-        if box:
-            print(f"   >> [JS] 找到 Turnstile: {box}", flush=True)
-            break
-        await asyncio.sleep(0.5)
-
-    # 阶段2.5：所有方法失败 → 动态坐标兜底
-    # CF Turnstile 在登录表单底部，checkbox 约在窗口水平中央偏左、垂直约75%处
-    if not box:
-        await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_iframe_not_found.png"))
-        try:
-            win = await _js(tab, "({w: window.innerWidth, h: window.innerHeight})")
-            win_w = win.get('w', 1280) if isinstance(win, dict) else 1280
-            win_h = win.get('h', 720)  if isinstance(win, dict) else 720
-            # 截图分析：
-            # - 截图尺寸 1279x576，窗口 1280x720，差值144px = 浏览器地址栏高度
-            # - checkbox 在截图约 (152, 390)，换算窗口坐标: x=152, y=390+144=534
-            # - 用截图比例动态换算
-            addr_bar_h = win_h - 576  # 地址栏高度（截图高度固定576）
-            cx = 152  # checkbox 水平位置固定（登录卡片左侧）
-            cy = 390 + addr_bar_h   # 截图内 y=390，加地址栏偏移
-            print(f"   >> 自动定位失败，动态坐标兜底 ({cx}, {cy})，窗口={win_w}x{win_h} 地址栏={addr_bar_h}", flush=True)
-            await tab.mouse.click(cx, cy, humanize=True)
-        except Exception as e:
-            print(f"   >> 动态坐标点击失败: {e}", flush=True)
-            return False
-        for i in range(int(timeout * 2)):
-            if await _turnstile_token_ready(tab):
-                print(f"   >> Turnstile token 就绪（动态坐标，{i * 0.5:.1f}s）", flush=True)
-                return True
-            await asyncio.sleep(0.5)
-        print("   >> 动态坐标点击后 token 超时", flush=True)
-        return False
-
-    # 坐标合理性校验：x/y 必须在视口范围内
-    bx = box.get("x", -1)
-    by = box.get("y", -1)
-    bh = box.get("height", 0)
-    if not (0 <= bx < 1200 and 0 <= by < 800):
-        print(f"   >> ❌ bounding_box 坐标异常 ({bx:.0f}, {by:.0f})，跳过点击", flush=True)
-        await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_bad_coords.png"))
-        return False
-
-    # checkbox 在容器左侧约 28px，垂直居中
-    x = bx + 28
-    y = by + bh / 2
-    print(f"   >> 坐标点击 Turnstile checkbox ({x:.0f}, {y:.0f})", flush=True)
-    try:
-        # humanize=True 内部：贝塞尔曲线 + Fitts定律 + 生理颤抖 + 超调修正 + 随机按压时长
-        await tab.mouse.click(x, y, humanize=True)
-    except Exception as e:
-        print(f"   >> ❌ 坐标点击失败: {e}", flush=True)
-        await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_click_failed.png"))
-        return False
-
-    # 阶段3：点击后等待 token 写入
-    for i in range(int(timeout * 2)):
-        if await _turnstile_token_ready(tab):
-            print(f"   >> ✅ Turnstile token 就绪（{i * 0.5:.1f}s）", flush=True)
-            return True
-        await asyncio.sleep(0.5)
-
-    print("   >> ❌ Turnstile token 等待超时", flush=True)
-    await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_token_timeout.png"))
-    return False
-
-# ----- 登录 -----
-
-def mask_email(email: str) -> str:
-    """将邮箱脱敏：user@domain.com -> u***@d***.com"""
-    if not email or "@" not in email:
-        return "***"
-    local, domain = email.split("@", 1)
-    masked_local = local[0] + "***" if len(local) > 1 else "***"
-    domain_parts = domain.split(".")
-    masked_domain = domain_parts[0][0] + "***" if len(domain_parts[0]) > 1 else "***"
-    return f"{masked_local}@{masked_domain}.{'.'.join(domain_parts[1:])}"
-
-def mask_sid(sid) -> str:
-    """将服务器ID脱敏"""
-    s = str(sid)
-    return s[:2] + "***" if len(s) > 2 else "***"
-
-async def do_login(browser, tab, user: dict) -> bool:
+# ---------- 登录 ----------
+def do_login(page, user: dict) -> bool:
     u, p = user["username"], user["password"]
-    print(f"  🔑 清理旧 session: {mask_email(u)}", flush=True)
+
+    # 先清理旧 session
     try:
-        await tab.go_to("https://dashboard.katabump.com/auth/logout")
-        await asyncio.sleep(0.5)
+        page.goto(LOGOUT_URL, timeout=15000, wait_until="domcontentloaded")
+        time.sleep(1)
     except Exception:
         pass
 
     for attempt in range(1, 4):
-        print(f"\n  🔑 登录 {attempt}/3: {mask_email(u)}", flush=True)
-        await tab.go_to("https://dashboard.katabump.com/auth/login")
-        await asyncio.sleep(3)
+        log.info(f"\n🔑 登录 {attempt}/3: {mask_email(u)}")
 
-        if "dashboard" in await get_url(tab) and "login" not in await get_url(tab):
-            print("   >> ✅ Session 仍有效", flush=True)
+        if not navigate(page, LOGIN_URL):
+            log.error("  CF 验证失败，重试")
+            continue
+
+        # 检查是否已登录
+        if "login" not in page.url and "dashboard" in page.url:
+            log.info("  ✅ Session 仍有效")
             return True
 
-        print("   >> 填表...", flush=True)
         try:
-            filled = await _js(tab, f"""
-                (function() {{
-                    const email = document.querySelector('input[name="email"], input[type="email"]');
-                    const pass = document.querySelector('input[name="password"], input[type="password"]');
-                    if (email && pass) {{
-                        email.value = {json.dumps(u)};
-                        email.dispatchEvent(new Event('input', {{bubbles:true}}));
-                        email.dispatchEvent(new Event('change', {{bubbles:true}}));
-                        pass.value = {json.dumps(p)};
-                        pass.dispatchEvent(new Event('input', {{bubbles:true}}));
-                        pass.dispatchEvent(new Event('change', {{bubbles:true}}));
-                        return true;
-                    }}
-                    return false;
-                }})()
-            """)
-            if not filled:
-                email_el = await tab.find(tag_name="input", name="email", timeout=5)
-                await email_el.click()
-                await email_el.type_text(u, humanize=True)
-                pass_el = await tab.find(tag_name="input", name="password", timeout=3)
-                await pass_el.click()
-                await pass_el.type_text(p, humanize=True)
-        except Exception as e:
-            print(f"   >> 填表失败: {e}", flush=True)
+            page.wait_for_selector(
+                'input[name="email"], input[type="email"]',
+                timeout=10000
+            )
+        except Exception:
+            log.warning("  找不到邮箱输入框，重试")
+            take_screenshot(page, f"login_no_input_{attempt}")
             continue
 
-        await handle_captcha(tab, is_renew=False)
-        await asyncio.sleep(2)
-
-        # Cloudflare Turnstile 坐标点击
-        has_turnstile = await _js(tab, "!!document.querySelector('input[name=\"cf-turnstile-response\"]') || !!document.querySelector('div.cf-turnstile')")
-        if has_turnstile is True or str(has_turnstile).lower() == "true":
-            ok = await click_login_turnstile_checkbox(browser, tab, timeout=20)
-            if not ok:
-                print("   >> Turnstile 未完成，刷新重试...", flush=True)
-                await tab.refresh()
-                await asyncio.sleep(2)
-                continue
-
-        await tab.execute_script("""(function() {
-            const bar = document.querySelector('[aria-label="Save password?"]');
-            if (bar) bar.remove();
-        })()""")
-        print("   >> 点击 Login...", flush=True)
+        log.info("  填写表单...")
         try:
-            btn = await tab.find(tag_name="button", text="Login", timeout=2)
-            await btn.click()
-        except Exception:
-            await tab.execute_script("document.querySelector('button[type=submit]')?.click()")
+            email_el = page.locator('input[name="email"], input[type="email"]').first
+            email_el.click()
+            email_el.fill("")
+            page.type('input[name="email"], input[type="email"]', u, delay=random.randint(60, 140))
+            human_delay()
 
-        for _ in range(10):
-            await asyncio.sleep(1)
-            url = await get_url(tab)
-            if "dashboard" in url and "login" not in url:
-                print("   >> ✅ 登录成功", flush=True)
+            pass_el = page.locator('input[name="password"], input[type="password"]').first
+            pass_el.click()
+            pass_el.fill("")
+            page.type('input[name="password"], input[type="password"]', p, delay=random.randint(60, 140))
+            human_delay()
+        except Exception as e:
+            log.warning(f"  填表失败: {e}")
+            continue
+
+        # Turnstile token 等待（CloakBrowser 通常自动处理，这里给 10s）
+        log.info("  等待 Turnstile token...")
+        for _ in range(20):
+            has_token = page.evaluate("""() => {
+                function deepQ(root, sel) {
+                    let el = root.querySelector(sel);
+                    if (el) return el;
+                    for (const h of root.querySelectorAll('*'))
+                        if (h.shadowRoot) { el = deepQ(h.shadowRoot, sel); if (el) return el; }
+                    return null;
+                }
+                const el = deepQ(document, 'input[name="cf-turnstile-response"]');
+                return el ? el.value.length > 10 : false;
+            }""")
+            if has_token:
+                log.info("  ✅ Turnstile token 就绪")
+                break
+
+            # 检查是否需要手动点击
+            has_cf = page.evaluate("""() => !!(
+                document.querySelector('div.cf-turnstile') ||
+                document.querySelector('input[name="cf-turnstile-response"]')
+            )""")
+            if has_cf:
+                time.sleep(0.5)
+            else:
+                break  # 无 Turnstile，直接登录
+        else:
+            # 10s 未自动通过 → 手动坐标点击
+            log.info("  Turnstile 未自动通过，尝试坐标点击...")
+            cf_frame, box = _find_stable_cf_frame(page, stable_timeout=10)
+            if cf_frame and box:
+                x = box["x"] + 25
+                y = box["y"] + box["height"] / 2
+                try:
+                    page.mouse.move(x, y)
+                    time.sleep(random.uniform(0.2, 0.4))
+                    page.mouse.click(x, y)
+                    log.info(f"  坐标点击 ({x:.0f}, {y:.0f})")
+                    # 等 token
+                    for _ in range(20):
+                        time.sleep(0.5)
+                        ok = page.evaluate("""() => {
+                            function deepQ(root, sel) {
+                                let el = root.querySelector(sel);
+                                if (el) return el;
+                                for (const h of root.querySelectorAll('*'))
+                                    if (h.shadowRoot) { el = deepQ(h.shadowRoot, sel); if (el) return el; }
+                                return null;
+                            }
+                            const el = deepQ(document, 'input[name="cf-turnstile-response"]');
+                            return el ? el.value.length > 10 : false;
+                        }""")
+                        if ok:
+                            log.info("  ✅ Turnstile token 就绪（坐标点击后）")
+                            break
+                    else:
+                        log.warning("  Turnstile token 仍未就绪，继续尝试登录")
+                except Exception as e:
+                    log.warning(f"  坐标点击失败: {e}")
+            else:
+                log.warning("  未找到 CF frame，继续尝试登录")
+
+        take_screenshot(page, f"login_before_submit_{attempt}")
+        log.info("  点击 Login 按钮...")
+        try:
+            page.locator("button[type='submit']").first.click()
+        except Exception:
+            page.evaluate("""() => {
+                const btn = document.querySelector('button[type="submit"]');
+                if (btn) btn.click();
+            }""")
+
+        # 等跳转
+        for _ in range(12):
+            time.sleep(1)
+            if "login" not in page.url and ("dashboard" in page.url or page.url == BASE_URL + "/"):
+                log.info("  ✅ 登录成功")
+                take_screenshot(page, "login_success")
                 return True
+
+        log.warning(f"  登录后未跳转（url={page.url}），重试")
+        take_screenshot(page, f"login_no_redirect_{attempt}")
+
     return False
 
-# ----- 续期（返回 (成功bool, 细节str)）-----
-async def do_renew(browser, tab, user: dict):
+# ---------- 续期 ----------
+def do_renew(page, user: dict):
     u   = user["username"]
-    sid = user.get("serverId") or os.getenv("KATABUMP_SERVER_ID")
+    sid = user.get("serverId") or os.getenv("KATABUMP_SERVER_ID", "")
     if not sid:
-        print("   >> ❌ 未提供 serverId，跳过续期", flush=True)
+        log.error("  未提供 serverId，跳过")
         return False, "缺少 serverId"
-    sf  = u.replace("@", "_").replace(".", "_")
+    sf = u.replace("@", "_").replace(".", "_")
 
-    print(f"   >> 导航到 servers/edit?id={mask_sid(sid)}", flush=True)
-    await tab.go_to(f"https://dashboard.katabump.com/servers/edit?id={sid}")
-    await asyncio.sleep(2)
+    url = f"{BASE_URL}/servers/edit?id={sid}"
+    log.info(f"  导航到 servers/edit?id={mask_sid(sid)}")
+    try:
+        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        time.sleep(2)
+    except Exception as e:
+        log.warning(f"  导航失败: {e}")
 
     for attempt in range(1, 4):
-        print(f"\n  🔄 续期 {attempt}/3: {mask_email(u)}", flush=True)
-        btn = await tab.find(tag_name="button", text="Renew", timeout=3, raise_exc=False)
-        if not btn:
-            print("   >> 找不到 Renew 按钮", flush=True)
+        log.info(f"\n🔄 续期 {attempt}/3: {mask_email(u)}")
+
+        # 找 Renew 按钮
+        try:
+            btn = page.locator("button", has_text="Renew").first
+            btn.wait_for(timeout=5000, state="visible")
+        except Exception:
+            log.warning("  找不到 Renew 按钮")
             return False, "找不到 Renew 按钮"
 
-        await btn.click()
-        print("   >> 已点击 Renew，等待 modal...", flush=True)
+        btn.click()
+        log.info("  已点击 Renew，等待 modal...")
 
+        # 等 modal 出现
+        modal_visible = False
         for _ in range(10):
-            await asyncio.sleep(1)
-            visible = await _js(tab, """
-                (function() {
-                    const m = document.querySelector('#renew-modal');
-                    return m && m.getBoundingClientRect().width > 0;
-                })()
-            """)
-            if visible is True or str(visible).lower() == "true":
+            time.sleep(1)
+            visible = page.evaluate("""() => {
+                const m = document.querySelector('#renew-modal');
+                return m && m.getBoundingClientRect().width > 0;
+            }""")
+            if visible:
+                modal_visible = True
                 break
-        else:
-            print("   >> modal 未出现，刷新重试", flush=True)
-            await tab.refresh()
-            await asyncio.sleep(2)
+
+        if not modal_visible:
+            log.warning("  modal 未出现，刷新重试")
+            page.reload(wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2)
             continue
 
-        print("   >> modal 已打开，处理 ALTCHA...", flush=True)
-        if not await handle_captcha(tab, is_renew=True):
-            print("   >> ALTCHA 失败，刷新重试", flush=True)
-            await tab.refresh()
-            await asyncio.sleep(1.5)
+        log.info("  modal 已打开，处理 ALTCHA...")
+        if not solve_altcha_in_modal(page):
+            log.warning("  ALTCHA 失败，刷新重试")
+            page.reload(wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2)
             continue
 
-        # 等待续期结果 (最多8秒)
+        # 等续期结果
         for _ in range(8):
-            await asyncio.sleep(1)
-            gone = await _js(tab, "!document.querySelector('#renew-modal')")
-            if gone is True or str(gone).lower() == "true":
-                print("   >> ✅ 续期成功！", flush=True)
-                await asyncio.sleep(2)  # 等待页面 Expiry 数据刷新
-                next_time = await _get_next_renew_time(tab)
-                sp = SHOT_DIR / f"{sf}_ok.png"
-                await take_screenshot(browser, tab, str(sp))
+            time.sleep(1)
+            gone = page.evaluate("() => !document.querySelector('#renew-modal')")
+            if gone:
+                log.info("  ✅ 续期成功！")
+                time.sleep(2)
+                next_time = get_next_renew_time(page)
+                take_screenshot(page, f"{sf}_ok")
                 return True, next_time
 
-            # ✅ 修复：完整捕获 “You can't renew ... (in X day(s)).” 整个句子
-            not_yet_msg = await _js(tab, """
-                (function() {
-                    const bodyText = document.body.innerText;
-                    // 匹配从 "You can't renew" 开始，直到遇到两个句号或字符串末尾
-                    const match = bodyText.match(/You can't renew[^.]*\\.[^.]*?\\./i);
-                    if (match) {
-                        return match[0].replace(/\\s+/g, ' ').trim();
-                    }
-                    // 如果只有一个句号，退而求其次
-                    const match2 = bodyText.match(/You can't renew[^.]*\\./i);
-                    return match2 ? match2[0].replace(/\\s+/g, ' ').trim() : null;
-                })()
-            """)
-            if not_yet_msg:
-                print(f"   >> ⏳ {not_yet_msg}", flush=True)
-                sp = SHOT_DIR / f"{sf}_skip.png"
-                await take_screenshot(browser, tab, str(sp))
-                return False, not_yet_msg
+            # 检查"不能续期"提示
+            body = get_text(page)
+            m = re.search(r"You can't renew[^.]*\.[^.]*?\.", body, re.I)
+            if not m:
+                m = re.search(r"You can't renew[^.]*\.", body, re.I)
+            if m:
+                msg = re.sub(r'\s+', ' ', m.group(0)).strip()
+                log.info(f"  ⏳ {msg}")
+                take_screenshot(page, f"{sf}_skip")
+                return False, msg
 
-        # 未确定结果，刷新重试
-        await tab.refresh()
-        await asyncio.sleep(1.5)
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
 
-    return False, "多次尝试续期未成功"
+    return False, "多次尝试未成功"
 
-# ----- 主流程 -----
-async def main():
+# ---------- 主流程 ----------
+def main():
     users = load_users()
     if not users:
-        print("❌ 未设置 USERS_JSON")
+        log.error("❌ 未设置 USERS_JSON")
         sys.exit(1)
 
-    SHOT_DIR.mkdir(parents=True, exist_ok=True)
-    opts = build_options()
-    print(f"\n🚀 开始 | 用户: {len(users)} | Headless: {HEADLESS}", flush=True)
+    from cloakbrowser import launch
+    log.info("启动 CloakBrowser...")
+    browser = launch(
+        headless=False,
+        humanize=True,
+        proxy=PROXY_SERVER,
+        geoip=True,
+    )
+    page = browser.new_page()
 
-    browser = None
-    for i in range(3):
-        try:
-            async with asyncio.timeout(60):
-                browser = Chrome(options=opts)
-                await browser.__aenter__()
-            break
-        except Exception as e:
-            print(f"❌ Chrome 启动失败 ({i+1}/3): {e}", flush=True)
-            if browser:
-                try: await browser.__aexit__(None, None, None)
-                except: pass
-                browser = None
-            if i == 2:
-                await send_wxpusher("❌ Chrome 多次启动失败，放弃")
-                sys.exit(1)
-            await asyncio.sleep(3)
-
-    tab = None
-    try:
-        async with asyncio.timeout(30):
-            for _ in range(5):
-                try:
-                    tab = await browser.start()
-                    break
-                except Exception:
-                    await asyncio.sleep(1.5)
-        if not tab:
-            raise RuntimeError("无法创建 tab")
-    except Exception as e:
-        print(f"❌ tab 创建失败: {e}", flush=True)
-        await browser.__aexit__(None, None, None)
-        sys.exit(1)
-
-    results = []   # 收集报告 (username, success, detail)
+    results = []
     try:
         for user in users:
             u = user["username"]
-            print(f"\n{'='*40} [{mask_email(u)}] {'='*40}", flush=True)
+            log.info(f"\n{'='*40} [{mask_email(u)}] {'='*40}")
             try:
-                if not await do_login(browser, tab, user):
+                if not do_login(page, user):
                     results.append((u, False, "登录失败"))
                     continue
-                success, detail = await do_renew(browser, tab, user)
-                results.append((u, success, detail))
+                ok, detail = do_renew(page, user)
+                results.append((u, ok, detail))
             except Exception as e:
-                print(f"   >> ❌ {type(e).__name__}: {e}", flush=True)
-                traceback.print_exc()
-                results.append((u, False, f"异常: {str(e)[:50]}"))
-            sf = u.replace("@", "_").replace(".", "_")
-            await take_screenshot(browser, tab, str(SHOT_DIR / f"{sf}.png"))
+                import traceback
+                log.exception(e)
+                take_screenshot(page, f"error_{u.replace('@','_')}")
+                results.append((u, False, f"异常: {str(e)[:60]}"))
 
-        # 整合通知
+        # WxPusher 汇总
         if results:
-            summary_lines = ["📊 Katabump 自动续期报告"]
+            lines = ["📊 Katabump 自动续期报告"]
             for name, ok, detail in results:
                 icon = "✅" if ok else "❌"
-                summary_lines.append(f"\n{icon} {name}")
+                lines.append(f"\n{icon} {name}")
                 if detail:
-                    summary_lines.append(f"   {detail}")
-            await send_wxpusher("\n".join(summary_lines).strip())
+                    lines.append(f"   {detail}")
+            wxpush("\n".join(lines).strip())
 
-        # 所有账号处理完毕，等待3秒再退出，方便录屏观察
-        print("\n⏳ 所有流程结束，3秒后关闭浏览器...", flush=True)
-        await asyncio.sleep(3)
+        log.info("\n所有流程结束，5s 后关闭...")
+        time.sleep(5)
 
     finally:
-        try: await tab.close()
-        except: pass
-        try: await browser.__aexit__(None, None, None)
-        except: pass
+        try:
+            browser.close()
+        except Exception:
+            pass
 
-    print("\n✅ 整体流程结束", flush=True)
+    log.info("✅ 整体流程结束")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
