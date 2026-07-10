@@ -17,7 +17,7 @@ on:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: 检出代码
@@ -28,7 +28,7 @@ jobs:
           sudo apt-get update -qq
           curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb
           sudo apt-get install -y -qq /tmp/chrome.deb
-          sudo apt-get install -y -qq xvfb curl ffmpeg
+          sudo apt-get install -y -qq xvfb curl ffmpeg unzip
 
       - name: 安装 Python
         uses: actions/setup-python@v5
@@ -38,13 +38,36 @@ jobs:
       - name: 安装 Python 依赖
         run: pip install -r requirements.txt
 
+      - name: 下载并启动 Xray 代理
+        env:
+          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+        run: |
+          curl -sL https://github.com/XTLS/Xray-core/releases/download/v25.5.16/Xray-linux-64.zip -o xray.zip
+          unzip xray.zip && chmod +x xray
+          echo "$V2RAY_CONFIG" > config.json
+          ./xray run -c config.json &
+          sleep 5
+          echo "直连 IP："
+          curl -s --max-time 5 ifconfig.me || echo "(超时)"
+          echo ""
+          echo "代理 IP："
+          curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me || echo "(代理超时，请检查 V2RAY_CONFIG)"
+          echo ""
+
+      - name: 修复 DNS
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf
+          sudo chattr +i /etc/resolv.conf 2>/dev/null || true
+          sleep 2
+
       - name: 运行续期（带录屏）
         env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           USERS_JSON: ${{ secrets.USERS_JSON }}
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
           WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          HTTP_PROXY: "socks5://127.0.0.1:10808"
           HEADLESS: "false"
           DISPLAY: ":99"
           ENABLE_RECORDING: ${{ github.event.inputs.ENABLE_RECORDING || 'false' }}
@@ -61,10 +84,7 @@ jobs:
           fi
           timeout 150 python action_renew.py || echo "[EXIT] $?"
           if [ "$ENABLE_RECORDING" = "true" ]; then
-            # 用 SIGINT（等价于按 q），ffmpeg 会正常收尾写 moov atom，
-            # 而不是被 job 整体超时时 GitHub 直接 SIGKILL 导致文件损坏
             kill -INT $RECORD_PID 2>/dev/null || true
-            # 给 ffmpeg 最多 10 秒把 moov atom flush 完
             for i in $(seq 1 10); do
               kill -0 $RECORD_PID 2>/dev/null || break
               sleep 1
