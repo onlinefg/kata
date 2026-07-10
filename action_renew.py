@@ -479,17 +479,27 @@ def do_login(page, user: dict) -> bool:
                 if (btn) btn.click();
             }""")
 
-        # 等跳转——katabump 登录成功后离开 /auth/login 即算成功
-        for _ in range(12):
-            time.sleep(1)
-            cur = page.url
-            log.info(f"  [等跳转] url={cur}")
-            if "/auth/login" not in cur and "/auth/" not in cur:
-                log.info(f"  ✅ 登录成功（跳转到 {cur}）")
-                take_screenshot(page, "login_success")
-                return True
+        # 等跳转——用 wait_for_url 等离开 /auth/login（最多 20s）
+        log.info("  等待跳转离开 /auth/login ...")
+        try:
+            page.wait_for_url(
+                lambda url: "/auth/login" not in url and "/auth/" not in url,
+                timeout=20000
+            )
+            log.info(f"  ✅ 登录成功（跳转到 {page.url}）")
+            take_screenshot(page, "login_success")
+            return True
+        except Exception:
+            pass
 
-        log.warning(f"  登录后未跳转（url={page.url}），重试")
+        # wait_for_url 超时兜底：再轮询一次（应对 CloakBrowser URL 刷新延迟）
+        cur = page.url
+        if "/auth/login" not in cur and "/auth/" not in cur:
+            log.info(f"  ✅ 登录成功（兜底检测 {cur}）")
+            take_screenshot(page, "login_success")
+            return True
+
+        log.warning(f"  登录后未跳转（url={cur}），重试")
         take_screenshot(page, f"login_no_redirect_{attempt}")
 
     return False
