@@ -90,6 +90,7 @@ def _find_chromium() -> str | None:
 def build_options():
     opts = ChromiumOptions()
     opts.headless = HEADLESS
+    opts.start_timeout = 30
     path = _find_chromium()
     if path:
         opts.binary_location = path
@@ -113,6 +114,8 @@ def build_options():
     opts.add_argument("--use-mock-keychain")
     if HTTP_PROXY:
         opts.add_argument(f"--proxy-server={HTTP_PROXY}")
+        # 本地回环必须绕过代理，否则 pydoll 连不上 Chrome CDP 端口
+        opts.add_argument("--proxy-bypass-list=<-loopback>")
     opts.browser_preferences = {
         "credentials_enable_service": False,
         "profile": {
