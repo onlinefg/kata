@@ -596,23 +596,8 @@ async def do_login(browser, tab, user: dict) -> bool:
 
     for attempt in range(1, 4):
         print(f"\n  🔑 登录 {attempt}/3: {mask_email(u)}", flush=True)
-
-        if "dashboard" in await get_url(tab) and "login" not in await get_url(tab):
-            print("   >> ✅ Session 仍有效", flush=True)
-            return True
-
-        print("   >> 导航+等待 Turnstile...", flush=True)
-        try:
-            # pydoll 原生 CF bypass：在 go_to 前套 context manager，
-            # 页面 load 完成后自动穿透 shadow DOM 点击 checkbox
-            async with tab.expect_and_bypass_cloudflare_captcha(time_to_wait_captcha=15):
-                await tab.go_to("https://dashboard.katabump.com/auth/login")
-            print("   >> Turnstile 处理完成", flush=True)
-        except Exception as e:
-            print(f"   >> Turnstile context manager 异常: {e}", flush=True)
-            # 即使异常也继续，可能是 invisible 模式无 captcha
-
-        await asyncio.sleep(1)
+        await tab.go_to("https://dashboard.katabump.com/auth/login")
+        await asyncio.sleep(3)
 
         if "dashboard" in await get_url(tab) and "login" not in await get_url(tab):
             print("   >> ✅ Session 仍有效", flush=True)
@@ -646,6 +631,19 @@ async def do_login(browser, tab, user: dict) -> bool:
         except Exception as e:
             print(f"   >> 填表失败: {e}", flush=True)
             continue
+
+        await handle_captcha(tab, is_renew=False)
+        await asyncio.sleep(2)
+
+        # Cloudflare Turnstile 坐标点击
+        has_turnstile = await _js(tab, "!!document.querySelector('input[name=\"cf-turnstile-response\"]') || !!document.querySelector('div.cf-turnstile')")
+        if has_turnstile is True or str(has_turnstile).lower() == "true":
+            ok = await click_login_turnstile_checkbox(browser, tab, timeout=20)
+            if not ok:
+                print("   >> Turnstile 未完成，刷新重试...", flush=True)
+                await tab.refresh()
+                await asyncio.sleep(2)
+                continue
 
         await tab.execute_script("""(function() {
             const bar = document.querySelector('[aria-label="Save password?"]');
