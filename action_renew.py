@@ -320,77 +320,145 @@ async def _dump_frames(tab, label: str):
         print(f"   [诊断/{label}] dump_frames 失败: {e}", flush=True)
 
 
+async def _find_turnstile_box_cdp(tab) -> dict | None:
+    """
+    通过 CDP frame tree 确认 Turnstile 存在，再用 JS 累加 offset 定位点击位置。
+    原理：
+    - getBoundingClientRect() 对 closed shadow-root 宿主返回 width=0
+    - offsetTop/offsetLeft 向上累加到根可得到绝对渲染坐标（F12 已验证）
+    - F12 确认 iframe height=65px，offsetWidth=0 时强制用 300x65
+    """
+    try:
+        frames = await tab.get_frames()
+        cf_frame = None
+        for f in frames:
+            url = getattr(f, 'url', '') or ''
+            if 'challenges.cloudflare.com' in url or 'turnstile' in url.lower():
+                cf_frame = f
+                print(f"   >> CDP 找到 CF frame: {url[:80]}", flush=True)
+                break
+
+        if cf_frame is None:
+            print(f"   >> CDP frame tree 中共 {len(frames)} 个 frame，无 CF frame", flush=True)
+            for i, f in enumerate(frames[:5]):
+                print(f"     [{i}] {(getattr(f,'url','') or '')[:80]}", flush=True)
+            return None
+
+        # CF frame 存在，用累加 offset 获取真实绝对坐标
+        box = await _js(tab, """
+        (function() {
+            var el = document.querySelector('div.cf-turnstile') || document.querySelector('[data-sitekey]');
+            if (!el) return null;
+            var top = 0, left = 0, cur = el;
+            while (cur) {
+                top  += cur.offsetTop  || 0;
+                left += cur.offsetLeft || 0;
+                cur   = cur.offsetParent;
+            }
+            var w = el.offsetWidth  || 0;
+            var h = el.offsetHeight || 0;
+            return {
+                x: left,
+                y: top - window.scrollY,
+                width:  w < 10 ? 300 : w,
+                height: h < 10 ? 65  : h,
+                src: 'cdp-offset-accumulated'
+            };
+        })()
+        """)
+
+        if box and isinstance(box, dict) and box.get('x', -1) >= 0 and box.get('y', -1) >= 0:
+            print(f"   >> offset 坐标: x={box['x']:.0f} y={box['y']:.0f} w={box.get('width',0):.0f} h={box.get('height',0):.0f}", flush=True)
+            return box
+
+        return None
+    except Exception as e:
+        print(f"   >> CDP frame 查找失败: {e}", flush=True)
+        return None
+
+
 async def _find_turnstile_box_js(tab) -> dict | None:
     """
-    三层 fallback 定位 Turnstile checkbox 坐标：
-    1. div.cf-turnstile 容器（外层，有时 width=0 因内容在 shadow DOM）
-    2. iframe[src*="challenges.cloudflare.com"]（iframe 本身有真实尺寸）
-    3. 任何 width>=200 的 CF iframe（最宽松匹配）
+    穿透 Shadow DOM 递归查找 Turnstile iframe/容器坐标。
+    CF Turnstile 将 iframe 注入到 div.cf-turnstile 的 closed shadow-root 里，
+    document.querySelectorAll('iframe') 无法找到它。
+    策略：
+      1. div.cf-turnstile 容器坐标（外层有时有真实尺寸）
+      2. 递归穿透所有 shadowRoot 找 iframe[src*=challenges]
+      3. 递归穿透所有 shadowRoot 找任意 iframe（尺寸匹配）
     """
     js = """
     (function() {
-        // Layer 1: div.cf-turnstile 容器
-        var el = document.querySelector('div.cf-turnstile')
-               || document.querySelector('[data-sitekey]');
-        if (el) {
+        // 递归穿透 shadow DOM，收集所有元素
+        function deepQueryAll(root, sel) {
+            var results = [];
+            try {
+                var direct = root.querySelectorAll(sel);
+                for (var i = 0; i < direct.length; i++) results.push(direct[i]);
+                var all = root.querySelectorAll('*');
+                for (var j = 0; j < all.length; j++) {
+                    var sr = all[j].shadowRoot;
+                    if (sr) {
+                        var inner = deepQueryAll(sr, sel);
+                        for (var k = 0; k < inner.length; k++) results.push(inner[k]);
+                    }
+                }
+            } catch(e) {}
+            return results;
+        }
+
+        function rectOf(el) {
             var r = el.getBoundingClientRect();
             if (r.width > 0 && r.height > 0)
-                return {x: r.left, y: r.top, width: r.width, height: r.height, src: 'cf-turnstile-div'};
+                return {x: r.left, y: r.top, width: r.width, height: r.height};
+            return null;
         }
 
-        // Layer 2: 直接找 challenges.cloudflare.com iframe
-        var iframes = document.querySelectorAll('iframe');
+        // Layer 1: div.cf-turnstile 容器本身（有时外层就有尺寸）
+        var containers = deepQueryAll(document, 'div.cf-turnstile, [data-sitekey]');
+        for (var i = 0; i < containers.length; i++) {
+            var r = rectOf(containers[i]);
+            if (r) { r.src = 'shadow-cf-turnstile-div'; return r; }
+        }
+
+        // Layer 2: 穿透 shadow DOM 找 CF iframe（src 含 challenges）
+        var iframes = deepQueryAll(document, 'iframe');
         for (var i = 0; i < iframes.length; i++) {
-            var src = iframes[i].src || '';
+            var src = iframes[i].src || iframes[i].getAttribute('src') || '';
             if (src.indexOf('challenges.cloudflare.com') !== -1 ||
                 src.indexOf('turnstile') !== -1) {
-                var r2 = iframes[i].getBoundingClientRect();
-                if (r2.width > 0 && r2.height > 0)
-                    return {x: r2.left, y: r2.top, width: r2.width, height: r2.height, src: 'cf-iframe-direct'};
+                var r = rectOf(iframes[i]);
+                if (r) { r.src = 'shadow-cf-iframe'; return r; }
             }
         }
 
-        // Layer 3: 任何宽度在 200-400px 的 iframe（CF Turnstile 标准尺寸）
-        for (var j = 0; j < iframes.length; j++) {
-            var r3 = iframes[j].getBoundingClientRect();
-            if (r3.width >= 200 && r3.width <= 450 && r3.height > 0) {
-                return {x: r3.left, y: r3.top, width: r3.width, height: r3.height, src: 'iframe-size-match'};
+        // Layer 3: 穿透 shadow DOM 找尺寸匹配的任意 iframe
+        for (var i = 0; i < iframes.length; i++) {
+            var r2 = iframes[i].getBoundingClientRect();
+            if (r2.width >= 200 && r2.width <= 450 && r2.height >= 50) {
+                return {x: r2.left, y: r2.top, width: r2.width, height: r2.height,
+                        src: 'shadow-iframe-size', iframe_src: (iframes[i].src||'').substring(0,60)};
             }
         }
 
-        // Layer 4: div.cf-turnstile 有 el 但 width=0，返回其 offsetParent 坐标
-        if (el) {
-            var parent = el.closest('div,section,form');
-            if (parent) {
-                var rp = parent.getBoundingClientRect();
-                if (rp.width > 0)
-                    return {x: rp.left, y: rp.top + rp.height * 0.5 - 32,
-                            width: 300, height: 65, src: 'parent-fallback'};
-            }
+        // 诊断：返回找到的所有 iframe 信息
+        var info = [];
+        for (var i = 0; i < iframes.length; i++) {
+            var r3 = iframes[i].getBoundingClientRect();
+            info.push({src:(iframes[i].src||'').substring(0,60), w:Math.round(r3.width), h:Math.round(r3.height)});
         }
-
-        return null;
+        return {debug: true, iframes: info, containers: containers.length};
     })()
     """
     try:
         box = await _js(tab, js)
-        if box and isinstance(box, dict) and box.get("width", 0) > 0:
-            print(f"   >> Turnstile 定位成功（{box.get('src','?')}）: {box}", flush=True)
-            return box
-        else:
-            # 打印所有 iframe 信息帮助诊断
-            diag = await _js(tab, """
-            (function(){
-                var iframes = document.querySelectorAll('iframe');
-                var info = [];
-                for(var i=0;i<iframes.length;i++){
-                    var r = iframes[i].getBoundingClientRect();
-                    info.push({src: iframes[i].src.substring(0,80), w:r.width, h:r.height, x:r.left, y:r.top});
-                }
-                return JSON.stringify(info);
-            })()
-            """)
-            print(f"   >> 页面 iframe 列表: {diag}", flush=True)
+        if box and isinstance(box, dict):
+            if box.get("debug"):
+                print(f"   >> Shadow DOM 诊断: iframes={box.get('iframes')}, cf-turnstile容器数={box.get('containers')}", flush=True)
+                return None
+            if box.get("width", 0) > 0:
+                print(f"   >> Turnstile 定位成功（{box.get('src','?')}）: x={box.get('x'):.0f} y={box.get('y'):.0f} w={box.get('width'):.0f} h={box.get('height'):.0f}", flush=True)
+                return box
     except Exception as e:
         print(f"   >> JS 查找 Turnstile 失败: {e}", flush=True)
     return None
@@ -414,19 +482,37 @@ async def click_login_turnstile_checkbox(browser, tab, timeout: float = 20) -> b
             return True
         await asyncio.sleep(0.5)
 
-    # 阶段2：JS 递归遍历所有 iframe 找 Turnstile（含嵌套 wrapper）
+    # 阶段2：CDP frame tree 优先（能穿透 closed shadow DOM），JS 作 fallback
     box = None
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
+        # 先用 CDP（最可靠，能看到 closed shadow-root 里的 iframe）
+        box = await _find_turnstile_box_cdp(tab)
+        if box:
+            print(f"   >> [CDP] 找到 Turnstile: {box}", flush=True)
+            break
+        # CDP 失败再试 JS（open shadow DOM 降级场景）
         box = await _find_turnstile_box_js(tab)
         if box:
-            print(f"   >> 找到 Turnstile iframe: {box}", flush=True)
+            print(f"   >> [JS] 找到 Turnstile: {box}", flush=True)
             break
         await asyncio.sleep(0.5)
 
+    # 阶段2.5：所有方法失败 → 固定坐标兜底（截图确认 checkbox 在约 630,563）
     if not box:
-        print("   >> ❌ 未能定位 Turnstile iframe，放弃点击", flush=True)
+        print("   >> 自动定位全部失败，固定坐标兜底点击 (630, 563)", flush=True)
         await take_screenshot(browser, tab, str(SHOT_DIR / "turnstile_iframe_not_found.png"))
+        try:
+            await tab.mouse.click(630, 563, humanize=True)
+        except Exception as e:
+            print(f"   >> 固定坐标点击失败: {e}", flush=True)
+            return False
+        for i in range(int(timeout * 2)):
+            if await _turnstile_token_ready(tab):
+                print(f"   >> Turnstile token 就绪（固定坐标，{i * 0.5:.1f}s）", flush=True)
+                return True
+            await asyncio.sleep(0.5)
+        print("   >> 固定坐标点击后 token 超时", flush=True)
         return False
 
     # 坐标合理性校验：x/y 必须在视口范围内
